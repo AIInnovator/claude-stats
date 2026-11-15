@@ -24,7 +24,7 @@ jobs:
         node: ['22', 'lts/*']
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       # no Claude Code logs on a CI machine: the self-check skips its real-log comparisons and says so
