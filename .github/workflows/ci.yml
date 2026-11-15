@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Checks · Node ${{ matrix.node }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['22', 'lts/*']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      # no Claude Code logs on a CI machine: the self-check skips its real-log comparisons and says so
+      - run: npm run check
+
+  installers:
+    name: Installer · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      CLAUDE_STATS_NO_START: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - name: Lint install.sh
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
+        run: CLAUDE_STATS_DIR="$RUNNER_TEMP/claude-stats" sh install.sh
+      - name: Install with install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:CLAUDE_STATS_DIR = Join-Path $env:RUNNER_TEMP 'claude-stats'
+          Invoke-Expression (Get-Content -Raw ./install.ps1)
+      - name: The installed copy is complete
+        shell: bash
+        run: test -f "$RUNNER_TEMP/claude-stats/server.mjs" && test -f "$RUNNER_TEMP/claude-stats/public/index.html"

@@ -1,0 +1,5 @@
+# LF in the repository and in every checkout, so scripts and checks behave the same on Windows, macOS and Linux
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.woff2 binary
+*.png binary

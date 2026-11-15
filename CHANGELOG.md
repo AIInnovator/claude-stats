@@ -1,6 +1,19 @@
 # Changelog
 
+All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org).
+
 ## 1.0.0 (15 Nov 2026)
+
+Install and project
+- One-line installers: `install.sh` for macOS and Linux, `install.ps1` for Windows. Each one:
+  - installs the current Node.js LTS when Node 22+ is missing
+  - downloads the latest release into `~/.claude-stats`
+  - starts the dashboard
+
+  Re-run to update. An installer never replaces a folder that isn't a claude-stats install.
+- CI runs every check and both installers on Windows, macOS and Linux, with Node 22 and the current LTS. Tags publish GitHub releases with these notes.
+- The self-check runs on machines without Claude Code logs: it skips only the real-log comparisons and says so.
+- `npm test`, contributing guide, security policy, code of conduct, issue and pull request templates, `.editorconfig`, and LF line endings everywhere.
 
 Accounts and billing
 - Each session is tied to the account that ran it (Claude Code 2.1.317+ records it), through a one-way key; raw ids never reach the page.

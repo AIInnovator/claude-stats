@@ -1,13 +1,37 @@
 {
   "name": "claude-stats",
   "version": "1.0.0",
+  "description": "Local, live dashboard of your Claude Code usage: cost at API prices, tokens, models, tools, sessions and 5-hour windows, per account. Zero dependencies; nothing leaves your machine.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "dashboard",
+    "usage",
+    "cost-tracking",
+    "token-usage",
+    "analytics",
+    "developer-tools",
+    "local-first",
+    "zero-dependency"
+  ],
+  "homepage": "https://github.com/AIInnovator/claude-stats#readme",
+  "bugs": {
+    "url": "https://github.com/AIInnovator/claude-stats/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AIInnovator/claude-stats.git"
+  },
   "license": "MIT",
+  "author": "AIInnovator (https://github.com/AIInnovator)",
   "private": true,
-  "description": "Local, live dashboard for Claude Code usage stats (reads ~/.claude/projects, read-only).",
   "type": "module",
+  "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node scripts/machinecheck.mjs && node scripts/accountcheck.mjs && node scripts/selfcheck.mjs && node scripts/pathcheck.mjs && node scripts/lockcheck.mjs && node scripts/check-palette.mjs"
+    "check": "node scripts/machinecheck.mjs && node scripts/accountcheck.mjs && node scripts/selfcheck.mjs && node scripts/pathcheck.mjs && node scripts/lockcheck.mjs && node scripts/check-palette.mjs",
+    "test": "npm run check"
   },
   "engines": {
     "node": ">=22"

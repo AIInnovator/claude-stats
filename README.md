@@ -1,7 +1,26 @@
-# Claude Code usage stats
+# Claude Code Stats
+
+[![CI](https://github.com/AIInnovator/claude-stats/actions/workflows/ci.yml/badge.svg)](https://github.com/AIInnovator/claude-stats/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AIInnovator/claude-stats)](https://github.com/AIInnovator/claude-stats/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Node.js 22+](https://img.shields.io/badge/node-%E2%89%A522-339933?logo=nodedotjs&logoColor=white)
+![Zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+![Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 A local, live dashboard for your Claude Code usage. It reads the logs Claude Code writes on your
 machine and shows cost at API prices, tokens, models, tools, sessions and 5-hour windows, per account.
+
+**Install in one line**, then open http://127.0.0.1:7420:
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/AIInnovator/claude-stats/main/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/AIInnovator/claude-stats/main/install.ps1 | iex
+```
 
 ## What it is
 
@@ -12,7 +31,29 @@ machine and shows cost at API prices, tokens, models, tools, sessions and 5-hour
 - Geist and Geist Mono fonts are vendored in `public/fonts`, with their OFL license (`public/fonts/LICENSE.txt`).
 - Updates live while you work. Nothing leaves your computer.
 
-## Quick start
+## Install
+
+### One line (recommended)
+
+| System | Command |
+|---|---|
+| macOS, Linux | `curl -fsSL https://raw.githubusercontent.com/AIInnovator/claude-stats/main/install.sh \| sh` |
+| Windows (PowerShell) | `irm https://raw.githubusercontent.com/AIInnovator/claude-stats/main/install.ps1 \| iex` |
+
+The installer:
+1. Installs the current Node.js LTS if Node 22 or newer is missing:
+   - Windows: winget
+   - macOS: Homebrew when present, otherwise nvm
+   - Linux: nvm, in your home folder, without `sudo`
+2. Downloads the [latest release](https://github.com/AIInnovator/claude-stats/releases/latest) into `~/.claude-stats` (Windows: `%USERPROFILE%\.claude-stats`).
+3. Starts the dashboard. Ctrl+C stops it. Start it again with `node ~/.claude-stats/server.mjs`, or on Windows `node $HOME\.claude-stats\server.mjs`.
+
+- **Update:** run the same line again. It replaces only that folder, and never a folder that isn't a claude-stats install.
+- **Uninstall:** delete the folder. The dashboard keeps no other files; your saved view lives in the browser.
+- **Options:** `CLAUDE_STATS_DIR=<folder>` installs somewhere else; `CLAUDE_STATS_NO_START=1` installs without starting.
+- **Read before you run:** [`install.sh`](install.sh) and [`install.ps1`](install.ps1). CI runs both installers on Windows, macOS and Linux on every change.
+
+### Manual
 
 **1. Install Node.js 22 or newer.** Skip this if `node --version` already prints `v22` or higher.
 
@@ -239,19 +280,26 @@ scripts/selfcheck.mjs      Data-layer checks against your real logs
 scripts/pathcheck.mjs      Starts the real server as another user with data in several folders
 scripts/lockcheck.mjs      Proves reading never blocks another program editing the logs
 scripts/check-palette.mjs  Contrast and colorblind checks for the chart colors
-package.json               npm start and npm run check; no dependencies
+install.sh                 One-line installer for macOS and Linux
+install.ps1                One-line installer for Windows
+.github/workflows/         CI (checks and both installers on Windows, macOS, Linux) and releases from tags
+package.json               npm start and npm test; no dependencies
 CHANGELOG.md               What changed in each version
+CONTRIBUTING.md            How to set up, check and send a change
+SECURITY.md                How to report a vulnerability, and how the dashboard stays local
 LICENSE                    MIT license for the code (the fonts keep their own OFL license)
 ```
 
 ## Checks
 
 ```sh
-npm run check
+npm test    # same as npm run check
 ```
 
-It runs six scripts. `selfcheck.mjs` needs real logs on the machine and only reads them.
-`machinecheck.mjs`, `accountcheck.mjs`, `pathcheck.mjs`, `lockcheck.mjs` and `check-palette.mjs` need no logs.
+It runs six scripts. `selfcheck.mjs` compares the store with the real logs on the machine and only reads them; on a
+machine without Claude Code logs (such as CI) it skips that part and says so. `machinecheck.mjs`,
+`accountcheck.mjs`, `pathcheck.mjs`, `lockcheck.mjs` and `check-palette.mjs` need no logs. CI runs all six on
+Windows, macOS and Linux with Node 22 and the current LTS.
 
 `scripts/accountcheck.mjs`: the account key formula; session owners read in either order (a live tail and a full
 re-read agree); the lowest key when a session names two; ~110 repeated owner lines marking a session changed once;
@@ -363,6 +411,12 @@ Not built:
 - **Account panel says "No Claude login found".** Claude Code is logged out, uses an API key (no Claude account), or has not saved the account yet: run `/login` in Claude Code. If you set `CLAUDE_CONFIG_DIR` for the dashboard only, point it at the same folder Claude Code uses.
 - **Older days are empty.** Those transcripts are no longer on disk; Claude Code can delete old ones (the `cleanupPeriodDays` setting).
 - **Terminal says `fs.watch unavailable`.** Updates still arrive through the 4 s rescan, just a little later.
+
+## Contributing
+
+Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Found a security problem? Please
+report it privately, as [SECURITY.md](SECURITY.md) explains. Everyone taking part follows the
+[code of conduct](CODE_OF_CONDUCT.md). Changes per version are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

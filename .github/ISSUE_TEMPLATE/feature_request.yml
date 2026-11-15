@@ -1,0 +1,22 @@
+name: Feature request
+description: A number, chart or view you would like to see.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to find out
+      description: The question about your Claude Code usage that the dashboard can't answer yet.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: How it could show up on the page. A sketch or screenshot helps.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: It can be worked out from the logs Claude Code already writes on my machine (the dashboard never calls out to the internet).
