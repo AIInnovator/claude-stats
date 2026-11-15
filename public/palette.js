@@ -6,7 +6,7 @@ export const MODEL_ORDER = ['claude-opus-5-5', 'claude-fable-5-2', 'claude-sonne
 export const PALETTES = {
   dark: {
     SURFACE: '#0c0d10',
-    CATEGORICAL: ['#e2794f', '#4ea3f0', '#d9b23a', '#62d2e0', '#c99a6b', '#a9c7e8', '#e66b95', '#9bcf5a'],
+    CATEGORICAL: ['#e2794f', '#4ea3f0', '#d9b23a', '#6ee1d5', '#53ac8d', '#9050d3', '#e66b95', '#9bcf5a'],
     OTHER: '#5d6068',
     TOKEN_COLORS: { out: '#e2794f', in: '#4ea3f0', cw: '#d9b23a', cr: '#6b7384' },
     SEQUENTIAL: ['#1a1412', '#3a2219', '#5c3121', '#83432b', '#ad5a38', '#d77749', '#f1a074'], // rises in lightness
@@ -14,7 +14,7 @@ export const PALETTES = {
   },
   light: {
     SURFACE: '#ffffff',
-    CATEGORICAL: ['#c4572c', '#2f7fd0', '#a37a06', '#13879a', '#946234', '#5b7fa6', '#c2416f', '#5b8a1c'],
+    CATEGORICAL: ['#c4572c', '#2f7fd0', '#a37a06', '#0fa196', '#2e503e', '#6e3e91', '#c2416f', '#5b8a1c'],
     OTHER: '#9a9da5',
     TOKEN_COLORS: { out: '#c4572c', in: '#2f7fd0', cw: '#a37a06', cr: '#8790a0' },
     SEQUENTIAL: ['#f6ece6', '#f0d3c4', '#e7b096', '#dc8b66', '#cb6a3e', '#a94e24', '#7d3614'], // falls in lightness

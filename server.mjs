@@ -7,6 +7,7 @@ import { Store, Tailer, isTranscript } from './lib/store.mjs';
 import { scanInit, scanStep, WATCH_UNARMED, watchStep } from './lib/machines.mjs';
 import { PRICES } from './lib/pricing.mjs';
 import { claudePaths } from './lib/paths.mjs';
+import { readLogin } from './lib/accounts.mjs';
 
 const PORT = Number(process.env.PORT) || 7420;
 const HOST = '127.0.0.1';
@@ -46,25 +47,29 @@ if (!PATHS.projects.length) console.warn(`No Claude Code transcripts found. Look
 let lastWarning = '';
 const warnOnce = (msg) => { if (msg !== lastWarning) { lastWarning = msg; console.warn(msg); } };
 
-// ---- the Claude account Claude Code is logged in with now (lib/paths.mjs finds .claude.json), re-read only when that
-// file changes. Only these four fields are kept and sent; the login tokens live in another file this never opens.
-let acct = { key: '', value: null };
-function account() {
-  const f = claudePaths().account[0]; // shortcut: with several config folders the first one wins; pick the newest if people keep one per account
-  let key = '';
-  try { const st = fs.statSync(f); key = `${f}:${st.size}:${st.mtimeMs}`; } catch { /* no file: never logged in */ }
-  if (key === acct.key) return acct.value;
-  let u = null;
-  if (key) {
-    try { u = JSON.parse(fs.readFileSync(f, 'utf8')).oauthAccount || null; }
-    catch { return acct.value; } // caught mid-write by Claude Code: keep the last value, read it again next time
-  }
-  acct = { key, value: u ? { email: u.emailAddress || '', org: u.organizationName || '', type: u.organizationType || '', tier: u.userRateLimitTier || '' } : null };
-  return acct.value;
+// ---- the Claude logins saved in every .claude.json (lib/paths.mjs finds them), each re-read only when its file
+// changes. The current login is the first file's, as before; every login teaches the page its plan. Only the fields
+// readLogin keeps leave (a hashed key, never the ids); the login tokens live in another file this never opens.
+const loginCache = new Map(); // file -> { stat, value }
+function logins() {
+  const all = claudePaths().account.map((f) => {
+    let stat = '';
+    try { const st = fs.statSync(f); stat = `${st.size}:${st.mtimeMs}`; } catch { /* gone since listed */ }
+    const c = loginCache.get(f);
+    if (c?.stat === stat) return c.value;
+    let value = null;
+    try { if (stat) value = readLogin(f); } catch { return c?.value ?? null; } // caught mid-write by Claude Code: keep the last value, read it again next time
+    loginCache.set(f, { stat, value });
+    return value;
+  });
+  const accounts = [];
+  // one entry per account: a .claude folder can have a .claude.json inside and beside it naming the same login
+  for (const l of all) if (l?.key && !accounts.some((a) => a.key === l.key)) accounts.push({ key: l.key, type: l.type, tier: l.tier, org: l.org });
+  return { account: all[0] || null, accounts };
 }
 
 const meta = () => ({
-  account: account(), root: ROOTS.join(', '), files: fileCount(), bytes: sum((t) => [...t.files.values()].reduce((n, f) => n + f.off, 0)), scannedAt, started,
+  ...logins(), root: ROOTS.join(', '), files: fileCount(), bytes: sum((t) => [...t.files.values()].reduce((n, f) => n + f.off, 0)), scannedAt, started,
   prices: PRICES, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, lines: store.lines, badLines: store.badLines,
   recovered: store.recovered, readErrors: sum((t) => t.readErrors), rebuilds, lastRebuild: scan.lastRebuild,
 });
@@ -153,10 +158,10 @@ function onWatch(root, name) {
 watchAll();
 // Safety poll: a full check every 30 s while every folder is watched, every 4 s while one is not (no watcher,
 // or its folder doesn't exist yet). Idle cost while you work with Claude: one directory listing every 30 s.
-let lastPoll = Date.now(), sentAccount = JSON.stringify(account());
+let lastPoll = Date.now(), sentAccount = JSON.stringify(logins());
 setInterval(() => {
-  // a login switch writes no transcript line, so no delta would carry it: send the new account on its own
-  const a = JSON.stringify(account());
+  // a login switch writes no transcript line, so no delta would carry it: send the new account(s) on their own
+  const a = JSON.stringify(logins());
   if (a !== sentAccount) { sentAccount = a; broadcast('delta', { dicts: {}, tables: {}, sessions: {}, meta: meta() }); }
   const watched = ROOTS.every((r) => watch.get(r)?.state.kind === 'armed');
   if (watched && Date.now() - lastPoll < 30000) return;
@@ -196,11 +201,14 @@ function history() {
 }
 function searchHistory(q) {
   const words = (q.get('q') || '').toLowerCase().split(/\s+/).filter(Boolean);
-  const from = Number(q.get('from')) || 0, to = Number(q.get('to')) || Infinity, project = q.get('project') || '';
-  const limit = Math.min(Number(q.get('limit')) || 80, 400);
+  const from = Number(q.get('from')) || 0, to = Number(q.get('to')) || Infinity, project = q.get('project') || '', account = q.get('account') || '';
+  // the page pages through 60 at a time or asks for all; the cap only stops a runaway request
+  const limit = Math.min(Number(q.get('limit')) || 80, 20000);
+  // 'none': no owner line, or a session no transcript has (any more); a lookup only, so a GET never adds a session
+  const acctOf = (sid) => store.sessions.get(store.dicts.session.map.get(sid))?.acct || 'none';
   const items = []; let total = 0;
   for (const r of history()) {
-    if (r.t < from || r.t >= to || (project && r.project !== project) || !words.every(w => r.lc.includes(w))) continue;
+    if (r.t < from || r.t >= to || (project && r.project !== project) || (account && acctOf(r.sessionId) !== account) || !words.every(w => r.lc.includes(w))) continue;
     if (total++ < limit) items.push({ t: r.t, project: r.project, sessionId: r.sessionId, text: r.text.length > 4000 ? r.text.slice(0, 4000) + '…' : r.text });
   }
   return { total, items };

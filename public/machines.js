@@ -177,7 +177,7 @@ export function histStep(s, e) {
  * saved by an older version or edited by hand, so the page never shows data for a choice no control displays.
  * @typedef {typeof UI_DEFAULT} UiState
  */
-export const UI_DEFAULT = Object.freeze({ range: '7d', from: '', to: '', projects: [], models: [], subagents: true, advisor: true, metric: 'cost', split: 'model', heat: 'cost', toolSort: 'calls', attr: 'agent', sort: 't0', dir: -1, sessQ: '', sessLimit: 25, usageTable: false, theme: 'system', background: true, heatRange: 'page', histRange: 'page', hideAccount: false });
+export const UI_DEFAULT = Object.freeze({ range: '7d', from: '', to: '', projects: [], models: [], subagents: true, advisor: true, metric: 'cost', split: 'model', heat: 'cost', toolSort: 'calls', attr: 'agent', sort: 't0', dir: -1, sessQ: '', sessLimit: 25, usageTable: false, theme: 'system', background: true, heatRange: 'page', histRange: 'page', hideAccount: false, accounts: [], apiProjects: [] });
 const ENUMS = {
   range: ['today', '24h', '7d', '30d', '90d', 'all', 'custom', 'h1', 'h3', 'h6', 'h12'], metric: ['cost', 'tokens', 'calls'],
   split: ['model', 'tokens', 'project', 'agent'], heat: ['cost', 'calls', 'turn', 'speed', 'fail', 'reply', 'plen'],
@@ -190,13 +190,87 @@ export function uiStep(ui, patch) {
   const next = { ...UI_DEFAULT, ...ui, ...patch };
   for (const [k, allowed] of Object.entries(ENUMS)) if (!allowed.includes(next[k])) next[k] = UI_DEFAULT[k];
   for (const k of ['subagents', 'advisor', 'background', 'usageTable', 'hideAccount']) if (typeof next[k] !== 'boolean') next[k] = UI_DEFAULT[k];
-  for (const k of ['projects', 'models']) next[k] = Array.isArray(next[k]) ? [...new Set(next[k].filter((x) => typeof x === 'string' && x))] : [];
+  for (const k of ['projects', 'models', 'accounts', 'apiProjects']) next[k] = Array.isArray(next[k]) ? [...new Set(next[k].filter((x) => typeof x === 'string' && x))] : [];
   if (typeof next.sessQ !== 'string') next.sessQ = '';
   next.sessLimit = Number.isInteger(next.sessLimit) ? Math.min(10000, Math.max(25, next.sessLimit)) : 25;
   if (!DATE.test(next.from)) next.from = '';
   if (next.to !== 'now' && !DATE.test(next.to)) next.to = '';
   if (next.range === 'custom' && !next.from) next.range = UI_DEFAULT.range; // a custom range needs a start
   return next;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Accounts and billing: pure rules, tested in scripts/machinecheck.mjs.
+
+/**
+ * How a session's usage is billed: 'sub' (a subscription covers it), 'api' (per-token) or 'unknown'. Never guesses
+ * 'api': an owner line names a Claude account, so it is classed by that account's plan (unknown until learned);
+ * only a session with no account recorded can be per-token by the owner's own label on its project.
+ */
+export function billingClass(rec, hasKey, projectMarkedApi) {
+  if (!hasKey) return projectMarkedApi ? 'api' : 'unknown';
+  const type = rec?.type || '';
+  return !type ? 'unknown' : type.startsWith('claude_') ? 'sub' : 'api';
+}
+
+/** Remembered plans by account key. A record changes only when its plan, tier, org or day does; no email is kept. */
+export function mergeAccounts(memory, entries, today) {
+  let next = null;
+  for (const e of entries || []) {
+    if (!e || typeof e.key !== 'string' || !e.key) continue;
+    const old = (next || memory)[e.key] || {};
+    // an empty field never erases what an earlier login taught
+    const rec = { type: e.type || old.type || '', tier: e.tier || old.tier || '', org: e.org || old.org || '', seen: today };
+    if (old.type === rec.type && old.tier === rec.tier && old.org === rec.org && old.seen === rec.seen) continue;
+    next = { ...(next || memory), [e.key]: rec };
+  }
+  return { memory: next || memory, changed: !!next };
+}
+
+/** The account the 5-hour windows follow: the one picked in the filter, else the current login, else the most used. */
+export function followAccount(picked, currentKey, usageByKey) {
+  const real = (picked || []).filter((k) => k !== 'none');
+  if (real.length === 1) return real[0];
+  if (currentKey) return currentKey;
+  let best, max = -Infinity;
+  for (const [k, v] of usageByKey || []) if (k !== 'none' && v > max) { best = k; max = v; }
+  return best;
+}
+
+/** Dotted version compare: '2.10.0' is at least '2.1.317'. Anything unparsable is not. */
+export function verAtLeast(v, min) {
+  const a = String(v || '').split('.').map(Number), b = min.split('.').map(Number);
+  for (let i = 0; i < b.length; i++) { const x = a[i] || 0; if (Number.isNaN(x)) return false; if (x !== b[i]) return x > b[i]; }
+  return true;
+}
+
+/** One CSV cell. Text that starts with = + - @ gets a leading ' so a spreadsheet never runs it as a formula
+ * (session titles come from the logs); numbers stay numbers. */
+export function csvCell(v) {
+  let t = String(v ?? '');
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(t)) t = "'" + t;
+  return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+}
+
+// Links to a view: range and filters in the page address. An address that names a view wins for its tab (filters it
+// doesn't list mean none). In presenting mode project paths stay out of it; 'ph=1' keeps the saved project filter.
+const VIEW_FLAGS = [['sub', 'subagents'], ['adv', 'advisor'], ['bg', 'background']];
+export function viewFromQuery(search) {
+  const q = new URLSearchParams(search);
+  if (!q.has('range')) return {};
+  const v = { range: q.get('range'), from: q.get('from') || '', to: q.get('to') || '', models: q.getAll('m'), accounts: q.getAll('a') };
+  if (!q.has('ph')) v.projects = q.getAll('p');
+  for (const [k, key] of VIEW_FLAGS) v[key] = q.get(k) !== '0';
+  return v;
+}
+export function viewToQuery(ui) {
+  const q = new URLSearchParams({ range: ui.range });
+  if (ui.range === 'custom') { q.set('from', ui.from); q.set('to', ui.to); }
+  if (ui.hideAccount) { if (ui.projects.length) q.set('ph', '1'); } else for (const p of ui.projects) q.append('p', p);
+  for (const m of ui.models) q.append('m', m);
+  for (const a of ui.accounts) q.append('a', a);
+  for (const [k, key] of VIEW_FLAGS) if (!ui[key]) q.set(k, '0');
+  return q.toString();
 }
 
 /** A filter's chosen names against the names present in the data. Names with no data match nothing and are listed. */

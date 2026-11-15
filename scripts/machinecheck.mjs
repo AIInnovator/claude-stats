@@ -10,7 +10,7 @@ import { FILE_UNSEEN, fileStep, scanInit, scanStep, FIRST_DELAY_MS, MIN_GAP_MS, 
 import {
   TOOL_NONE, TOOL_CALL, TOOL_RESULT, TOOL_COMPLETE, hasCall, toolStep, COUNTER_EMPTY, counterStep, intervalOf, attribution,
   CONN_START, connStep, RENDER_START, renderStep, DRAWER_CLOSED, drawerStep, HIST_IDLE, histStep, UI_DEFAULT, uiStep, selection,
-  POP_CLOSED, popStep,
+  POP_CLOSED, popStep, billingClass, mergeAccounts, followAccount, verAtLeast, csvCell, viewFromQuery, viewToQuery,
 } from '../public/machines.js';
 import { Store, Tailer } from '../lib/store.mjs';
 
@@ -244,6 +244,56 @@ ok('REGRESSION unknown saved settings → defaults', () => {
   assert.equal(uiStep({}, { range: 'custom', from: '2026-11-01T08:00', to: 'now' }).to, 'now');
   assert.equal(uiStep({}, { sessLimit: 1e9 }).sessLimit, 10000);
   assert.deepEqual(uiStep(null, {}), { ...UI_DEFAULT }, 'nothing saved');
+  const acc =uiStep({ accounts: ['k1', 'k1', '', 3, 'none'], apiProjects: 'C:/p' }, {});
+  assert.deepEqual(acc.accounts, ['k1', 'none'], 'accounts deduped, junk dropped, the none sentinel kept');
+  assert.deepEqual(acc.apiProjects, [], 'apiProjects must be a list');
+});
+ok('billing class: subscription, per-token or unknown, never guessed as per-token', () => {
+  assert.equal(billingClass({ type: 'claude_team' }, true, false), 'sub');
+  assert.equal(billingClass({ type: 'claude_max' }, true, true), 'sub', 'an owner line beats a project marked API key');
+  assert.equal(billingClass({ type: 'api_console' }, true, false), 'api', 'an unseen non-claude_ type is per-token');
+  assert.equal(billingClass({ type: '' }, true, false), 'unknown', 'a login file without a plan type');
+  assert.equal(billingClass(undefined, true, true), 'unknown', 'key seen, plan not learned yet: unknown even in an API-key project');
+  assert.equal(billingClass(undefined, false, true), 'api', 'no account recorded, project marked API key');
+  assert.equal(billingClass(undefined, false, false), 'unknown', 'no account recorded, not marked');
+});
+ok('account memory: changes only when the plan, tier, org or day change; never stores an email', () => {
+  const a = mergeAccounts({}, [{ key: 'k1', type: 'claude_team', tier: 't5', org: 'Org', email: 'x@example.com' }], '2026-11-15');
+  assert.equal(a.changed, true);
+  assert.deepEqual(a.memory, { k1: { type: 'claude_team', tier: 't5', org: 'Org', seen: '2026-11-15' } });
+  const b = mergeAccounts(a.memory, [{ key: 'k1', type: 'claude_team', tier: 't5', org: 'Org' }], '2026-11-15');
+  assert.equal(b.changed, false); assert.equal(b.memory, a.memory, 'unchanged memory is the same object (nothing to save)');
+  const c = mergeAccounts(a.memory, [{ key: 'k1', type: '', tier: '', org: '' }], '2026-11-16');
+  assert.deepEqual(c.memory.k1, { type: 'claude_team', tier: 't5', org: 'Org', seen: '2026-11-16' }, 'an empty field never erases what was learned');
+  assert.equal(mergeAccounts(a.memory, [null, { key: '' }, { type: 'x' }], '2026-11-15').changed, false, 'junk entries are ignored');
+});
+ok('5-hour windows follow one account: the picked one, else the current login, else the most used', () => {
+  const use = new Map([['k1', 5], ['k2', 9], ['none', 50]]);
+  assert.equal(followAccount(['k1'], 'k2', use), 'k1');
+  assert.equal(followAccount(['k1', 'none'], 'k2', use), 'k1', 'none is not an account');
+  assert.equal(followAccount(['k1', 'k2'], 'k1', use), 'k1', 'two picked: the current login');
+  assert.equal(followAccount(['none'], 'k1', use), 'k1');
+  assert.equal(followAccount([], undefined, use), 'k2', 'logged out: the most used account, never none');
+  assert.equal(followAccount([], undefined, new Map()), undefined);
+  assert.equal(verAtLeast('2.1.317', '2.1.317'), true); assert.equal(verAtLeast('2.1.316', '2.1.317'), false);
+  assert.equal(verAtLeast('2.10.0', '2.1.317'), true); assert.equal(verAtLeast('', '2.1.317'), false); assert.equal(verAtLeast('abc', '2.1.317'), false);
+});
+ok('CSV cells: text that could run as a spreadsheet formula is defused; quotes, commas and line breaks are quoted', () => {
+  assert.equal(csvCell('=HYPERLINK("x")'), `"'=HYPERLINK(""x"")"`);
+  for (const t of ['+1', '-cmd', '@SUM(A1)']) assert.equal(csvCell(t), "'" + t);
+  assert.equal(csvCell(-5), '-5', 'a number stays a number');
+  assert.equal(csvCell('a,b'), '"a,b"'); assert.equal(csvCell('two\nlines'), '"two\nlines"');
+  assert.equal(csvCell(null), ''); assert.equal(csvCell('plain'), 'plain');
+});
+ok('links to a view: the address round-trips range and filters; presenting keeps paths out of it', () => {
+  const view = { ...UI_DEFAULT, range: 'custom', from: '2026-11-01T08:00', to: 'now', projects: ['C:/p one'], models: ['m1'], accounts: ['k1', 'none'], subagents: false };
+  const q = viewToQuery(view);
+  assert.deepEqual(uiStep(UI_DEFAULT, viewFromQuery('?' + q)), uiStep(UI_DEFAULT, { range: 'custom', from: '2026-11-01T08:00', to: 'now', projects: ['C:/p one'], models: ['m1'], accounts: ['k1', 'none'], subagents: false }));
+  const hidden = viewToQuery({ ...view, hideAccount: true });
+  assert.ok(!hidden.includes('p+one') && !hidden.includes('p%20one') && hidden.includes('ph=1'), 'no project path while presenting');
+  assert.equal('projects' in viewFromQuery('?' + hidden), false, 'ph=1 keeps the saved project filter');
+  assert.deepEqual(viewFromQuery(''), {}, 'no view in the address: the saved settings decide');
+  assert.deepEqual(viewFromQuery('?range=7d').projects, [], 'an address naming a view means no filters it does not list');
 });
 ok('REGRESSION a filter on a name with no data matches nothing and is listed', () => {
   assert.equal(selection([], ['', 'a']), null, 'no filter');

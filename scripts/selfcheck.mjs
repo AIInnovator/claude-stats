@@ -97,8 +97,9 @@ for (const [sIdx, sa] of A.sessions) {
   const sb = B.sessions.get(B.dicts.session.map.get(sa.id));
   assert.ok(Math.abs((sa.cs?.cost || 0) - (sb.cs?.cost || 0)) < 1e-9, 'session cost-state ' + sa.id);
   assert.equal(sb.title, sa.title, 'title ' + sa.id);
+  assert.equal(sb.acct, sa.acct, 'account key ' + sa.id);
 }
-ok('split + reordered ingest == single pass (all tables, all columns, session counters)');
+ok(`split + reordered ingest == single pass (all tables, all columns, session counters, account keys on ${[...A.sessions.values()].filter((m) => m.acct).length} sessions)`);
 
 // 4. pinned historical session (probe values, 2026-11-12)
 const sIdx = A.dicts.session.list.findIndex(s => s.startsWith('fea856be'));

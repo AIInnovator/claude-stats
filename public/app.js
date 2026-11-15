@@ -3,7 +3,8 @@
 import { PALETTES, MODEL_ORDER } from './palette.js';
 import {
   hasCall, intervalOf, attribution, CONN_START, connStep, RENDER_START, renderStep, DRAWER_CLOSED, drawerStep,
-  HIST_IDLE, histStep, UI_DEFAULT, uiStep, selection, POP_CLOSED, popStep,
+  HIST_IDLE, histStep, UI_DEFAULT, uiStep, selection, POP_CLOSED, popStep, billingClass, mergeAccounts, followAccount, verAtLeast,
+  csvCell, viewFromQuery, viewToQuery,
 } from './machines.js';
 
 // Active palette (swapped on theme change; each theme's set is validated against its own surface).
@@ -50,6 +51,7 @@ const usd = (v) => cur.format(v || 0);
 const usdShort = (v) => (!v ? '$0' : v >= 1000 ? '$' + nfc.format(v) : v >= 100 ? '$' + nf0.format(v) : '$' + v.toFixed(v >= 10 ? 1 : 2));
 const num = (v) => nfc.format(v || 0);
 const int = (v) => nf0.format(v || 0);
+const nCalls = (n) => `${int(n)} call${n === 1 ? '' : 's'}`;
 const pct = (v, d = 0) => (isFinite(v) ? (v * 100).toFixed(d) + '%' : '–');
 function dur(ms) {
   const sec = Math.round((ms || 0) / 1000);
@@ -70,10 +72,15 @@ const isoDay = (t) => { const d = new Date(t); return `${d.getFullYear()}-${Stri
 // Saved view settings change only through uiStep (public/machines.js), which also cleans old or hand-edited values.
 let ui = UI_DEFAULT;
 try { ui = uiStep(UI_DEFAULT, JSON.parse(localStorage.getItem('ccstats.ui') || '{}')); } catch { /* corrupt storage: defaults */ }
+// Links to a view (public/machines.js): range and filters also live in the address, so a view can be bookmarked or
+// two tabs can show two views.
+function syncUrl() { const q = '?' + viewToQuery(ui); if (q !== location.search) history.replaceState(null, '', q); }
+ui = uiStep(ui, viewFromQuery(location.search));
+syncUrl();
 const save = () => localStorage.setItem('ccstats.ui', JSON.stringify(ui));
 const set = (patch) => {
-  ui = uiStep(ui, patch); save(); render();
-  if ('range' in patch || 'from' in patch || 'projects' in patch || 'histRange' in patch) loadHistory(); // history follows its range + project
+  ui = uiStep(ui, patch); save(); syncUrl(); render();
+  if ('range' in patch || 'from' in patch || 'projects' in patch || 'accounts' in patch || 'histRange' in patch) loadHistory(); // history follows its range, project and account
 };
 
 let D = null;           // { dicts, tables, sessions: Map, meta, version }
@@ -84,6 +91,7 @@ function applySnapshot(snap) {
   D = { dicts: snap.dicts, tables: snap.tables, meta: snap.meta, sessions: new Map(Object.entries(snap.sessions).map(([k, v]) => [+k, v])), version: (D ? D.version : 0) + 1 }; // keep counting so caches built before a reconnect are invalidated
   // the drawer follows its session by id; a fresh snapshot (server restart, rebuild) may no longer contain it
   if (dr.kind === 'open' || dr.kind === 'opening') drawerEvent({ type: 'dataChanged', exists: D.dicts.session.includes(dr.sid) });
+  rememberAccounts();
 }
 function applyDelta(dl) {
   for (const [k, [start, vals]] of Object.entries(dl.dicts)) vals.forEach((v, i) => { D.dicts[k][start + i] = v; });
@@ -95,13 +103,17 @@ function applyDelta(dl) {
   for (const [k, v] of Object.entries(dl.sessions)) D.sessions.set(+k, v);
   D.meta = dl.meta;
   D.version++;
+  rememberAccounts();
 }
 
 // ---------------------------------------------------------------- labels & colours
 const modelColor = (name) => { const i = MODEL_ORDER.indexOf(name); return i >= 0 ? CATEGORICAL[i] : OTHER; };
 const modelName = (m) => (m || '').replace(/^claude-/, '').replace(/-(\d+)-(\d+)$/, ' $1.$2').replace(/-(\d+)$/, ' $1').replace(/^./, (c) => c.toUpperCase());
+// Presenting mode (the Account row's eye): the user-folder name, often the person's own name, leaves every path the page
+// shows, as text or tooltip. Paths stay whole in the data, so filters and search keep working.
+const maskPath = (p) => (ui.hideAccount && p ? String(p).replace(/(^|[\\/])(Users|home)([\\/])[^\\/]+/i, '$1$2$3…') : p);
 function projLabel(p) {
-  const parts = (p || '').split(/[\\/]/).filter(Boolean);
+  const parts = (maskPath(p) || '').split(/[\\/]/).filter(Boolean);
   return { name: parts.at(-1) || p || '(unknown)', parent: parts.slice(-3, -1).join('\\') };
 }
 const AGENT = { main: 'Main thread', subagent: 'Subagent' };
@@ -122,6 +134,7 @@ const EFFORT = ['low', 'medium', 'high', 'xhigh', 'max'];
 const TOKEN_LABEL = { out: 'Output', in: 'Input', cw: 'Cache write', cr: 'Cache read' };
 const RANGES = [{ v: 'today', label: 'Today' }, { v: '24h', label: '24h' }, { v: '7d', label: '7 days' }, { v: '30d', label: '30 days' }, { v: '90d', label: '90 days' }, { v: 'all', label: 'All' }];
 const HOURS = { h1: 1, h3: 3, h6: 6, h12: 12 }; // rolling "last N hours" ranges from the Dates popover
+const NARROW = matchMedia('(max-width: 1020px)'); // matches the CSS that moves the range buttons into the Dates menu
 const ROLLING = new Set(['today', '24h', 'h1', 'h3', 'h6', 'h12']);
 function liveEnd() { return ui.range === 'custom' && ui.to === 'now'; } // custom range whose end follows the clock
 function isRolling() { return ROLLING.has(ui.range) || liveEnd(); }
@@ -198,15 +211,50 @@ function bucketLabel(B, b, long) {
   return long ? fWeekday.format(t) : fDay.format(t);
 }
 
+// ---------------------------------------------------------------- accounts: which account ran a session, and how it is billed
+// The server sends a one-way key per session (from Claude Code's session-owner lines) and the plan of every login it
+// finds; the browser remembers plans by key, so an account's plan stays known after you log out of it.
+const ACCT_STORE = 'ccstats.accounts';
+let acctMem = {};
+try { acctMem = JSON.parse(localStorage.getItem(ACCT_STORE) || '{}') || {}; } catch { /* corrupt storage: start empty */ }
+function rememberAccounts() {
+  const r = mergeAccounts(acctMem, [D.meta.account, ...(D.meta.accounts || [])], isoDay(Date.now()));
+  if (r.changed) { acctMem = r.memory; try { localStorage.setItem(ACCT_STORE, JSON.stringify(acctMem)); } catch { /* full or blocked */ } }
+}
+const acctOf = (s) => D.sessions.get(s)?.acct || 'none';
+const planName = (type, tier) => { const p = (type || '').replace(/^claude_/, '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()) || 'Unknown', x = (tier || '').match(/_(\d+x)$/)?.[1]; return x ? `${p} ${x}` : p; };
+// per data version, settings and memory: each session's billing class, and account numbers in order of first use
+let acctCache = { v: '' };
+function acctInfo() {
+  const v = `${D.version}|${ui.apiProjects.join('\n')}|${JSON.stringify(acctMem)}|${ui.hideAccount}`;
+  if (acctCache.v === v) return acctCache;
+  const api = new Set(ui.apiProjects), cls = new Map(), first = new Map();
+  for (const [s, m] of D.sessions) {
+    cls.set(s, billingClass(acctMem[m.acct], !!m.acct, api.has(D.dicts.project[m.p])));
+    if (m.acct && (!first.has(m.acct) || m.t0 < first.get(m.acct))) first.set(m.acct, m.t0 || 0);
+  }
+  const num = new Map([...first].sort((a, b) => a[1] - b[1]).map(([k], i) => [k, i + 1]));
+  const raw = (k) => { const rec = acctMem[k]; if (!rec?.type) return `Account ${num.get(k) || '?'} · plan not known yet`; return !ui.hideAccount && rec.org ? `${planName(rec.type, rec.tier)} · ${rec.org}` : `${planName(rec.type, rec.tier)} · account ${num.get(k) || '?'}`; };
+  const labels = new Map([...num.keys()].map((k) => [k, raw(k)]));
+  // two accounts reading the same (same plan and org) get their number too
+  const seen = new Map(); for (const l of labels.values()) seen.set(l, (seen.get(l) || 0) + 1);
+  for (const [k, l] of labels) if (seen.get(l) > 1) labels.set(k, `${l} (account ${num.get(k)})`);
+  acctCache = { v, cls, num, labels };
+  return acctCache;
+}
+const accountLabel = (k) => (k === 'none' ? 'No account recorded' : acctInfo().labels.get(k) || `Account · plan not known yet`);
+
 // ---------------------------------------------------------------- aggregation (one pass per table)
 const bump = (map, k, init) => { let v = map.get(k); if (!v) { v = init(); map.set(k, v); } return v; };
 // The view's filters, shared by every panel. A chosen name with no data matches nothing (the Filters menu lists it to untick).
 function filters() {
   const { dicts } = D, mainAgent = dicts.agent.indexOf('main');
   const projSel = selection(ui.projects, dicts.project), modelSel = selection(ui.models, dicts.model);
+  const acctSel = ui.accounts.length ? new Set(ui.accounts) : null;
   return {
     projSel, modelSel,
-    okP: (p) => !projSel || projSel.idx.has(p),
+    // every row carries its session; the account filter rides on the project check, so every panel gets both
+    okP: (p, s) => (!projSel || projSel.idx.has(p)) && (!acctSel || acctSel.has(acctOf(s))),
     okA: (a) => ui.subagents || a === mainAgent,
     okM: (m) => !modelSel || modelSel.idx.has(m),
     // a tool result whose call is in no file has no model: under a model filter it matches nothing
@@ -223,7 +271,7 @@ function compute() {
   const B = buckets(from, to);
   const R = tables.req.cols, nR = tables.req.n;
   const { okP, okA, okM, okToolModel, useBg } = filters();
-  const EST = sessionEstimates();
+  const EST = sessionEstimates(), acct = acctInfo(); // looked up once per pass, not per call
 
   // stable colours for project / agent splits: top 7 by all-time spend
   const allCost = { p: new Map(), a: new Map() };
@@ -240,18 +288,24 @@ function compute() {
     toolCalls: 0, toolErr: 0, toolDeny: 0, prevTools: 0, active: 0, turns: 0, longest: 0, prompts: 0, compactPre: 0, compactPost: 0,
     cc: { cost: 0, n: 0, add: 0, del: 0 }, branch: new Map(), days: new Map(), rawTok: 0, promptSrc: new Map(), bill: new Map(), bgModels: new Map(),
     hookRuns: 0, hookMs: 0, hookCount: 0, mtd: 0, check: { est: 0, cc: 0, n: 0 }, bg: 0, logged: 0,
+    // by billing class (subscription, per-token, unknown): the big number shows each for what it is
+    cls: Object.fromEntries(['sub', 'api', 'unknown'].map((k) => [k, { cost: 0, prev: 0, calls: 0, logged: 0, bg: 0, spark: new Float64Array(B.n) }])),
+    unk: { noKey: 0, noPlan: 0 }, // why unknown: no account recorded, or the account's plan not learned yet
   };
   const seriesAdd = (key, b, v) => { if (!v) return; let arr = A.series.get(key); if (!arr) { arr = new Float64Array(B.n); A.series.set(key, arr); } arr[b] += v; };
   const metric = ui.metric, split = metric === 'calls' && ui.split === 'tokens' ? 'model' : ui.split;
 
   for (let i = 0; i < nR; i++) {
     const t = R.t[i];
-    if (t < pFrom || t >= to || !okP(R.p[i]) || !okA(R.a[i]) || !okM(R.m[i]) || (!ui.advisor && R.adv[i])) continue;
+    if (t < pFrom || t >= to || !okP(R.p[i], R.s[i]) || !okA(R.a[i]) || !okM(R.m[i]) || (!ui.advisor && R.adv[i])) continue;
     const cost = R.cost[i] > 0 ? R.cost[i] : 0, cw = R.cw5[i] + R.cw1[i], tok = R.in[i] + R.out[i] + R.cr[i] + cw;
     const bg = useBg ? bgShare(EST, R.s[i], t) : null; // this call's period of Claude Code's saved counter
     const extra = bg ? cost * (bg.factor - 1) : 0, full = cost + extra; // extra = this call's share of unlogged background spend
     if (extra && t >= from) for (const [name, f] of bg.frac) A.bgModels.set(name, (A.bgModels.get(name) || 0) + extra * f);
-    if (t < from) { if (t >= pTo) continue; const P = A.prev; P.cost += full; P.tok += tok; P.calls++; P.sess.add(R.s[i]); P.cr += R.cr[i]; P.inAll += R.in[i] + R.cr[i] + cw; continue; }
+    const kc = acct.cls.get(R.s[i]) || 'unknown', cl = A.cls[kc];
+    if (t < from) { if (t >= pTo) continue; const P = A.prev; P.cost += full; P.tok += tok; P.calls++; P.sess.add(R.s[i]); P.cr += R.cr[i]; P.inAll += R.in[i] + R.cr[i] + cw; cl.prev += full; continue; }
+    cl.cost += full; cl.calls++; cl.logged += cost; cl.bg += extra;
+    if (kc === 'unknown') A.unk[acctOf(R.s[i]) === 'none' ? 'noKey' : 'noPlan'] += full;
     A.cost += full; A.logged += cost; A.bg += extra; A.in += R.in[i]; A.out += R.out[i]; A.cr += R.cr[i]; A.cw += cw; A.calls++; A.adv += R.adv[i];
     A.th += R.th[i]; A.tdm += R.tdm[i]; A.ws += R.ws[i]; A.wf += R.wf[i]; A.fast += R.fast[i];
     if (!R.adv[i]) A.rawTok += tok * R.ln[i]; // what a count of every log line (Claude Code's /stats) would show
@@ -269,7 +323,7 @@ function compute() {
       bl.cCr += R.cr[i] * pr[2] * mult / 1e6; bl.cOut += R.out[i] * pr[1] * mult / 1e6; bl.cWs += R.ws[i] * 0.01;
     }
     const b = bucketOf(B.edges, t);
-    A.spark[b] += full;
+    A.spark[b] += full; cl.spark[b] += full;
     const v = metric === 'cost' ? cost : metric === 'tokens' ? tok : 1;
     if (split === 'tokens') {
       if (metric === 'tokens') { seriesAdd('in', b, R.in[i]); seriesAdd('out', b, R.out[i]); seriesAdd('cw', b, cw); seriesAdd('cr', b, R.cr[i]); }
@@ -298,7 +352,7 @@ function compute() {
   const T = tables.tool.cols;
   for (let i = 0; i < tables.tool.n; i++) {
     const t = T.t[i];
-    if (t < pFrom || t >= to || !okP(T.p[i]) || !okA(T.a[i]) || !okToolModel(T, i, R)) continue;
+    if (t < pFrom || t >= to || !okP(T.p[i], T.s[i]) || !okA(T.a[i]) || !okToolModel(T, i, R)) continue;
     if (t < from) { if (t < pTo) A.prevTools++; continue; }
     const x = bump(A.tools, T.n[i], () => ({ calls: 0, err: 0, deny: 0 }));
     x.calls++; A.toolCalls++;
@@ -309,7 +363,7 @@ function compute() {
   const U = tables.turn.cols;
   for (let i = 0; i < tables.turn.n; i++) {
     const t = U.t[i];
-    if (t < pFrom || t >= to || !okP(U.p[i])) continue;
+    if (t < pFrom || t >= to || !okP(U.p[i], U.s[i])) continue;
     if (t < from) { if (t < pTo) A.prev.active += U.dur[i]; continue; }
     A.active += U.dur[i]; A.turns++; if (U.dur[i] > A.longest) A.longest = U.dur[i];
     (A.turnIv ||= []).push([t - U.dur[i], t]);
@@ -318,7 +372,7 @@ function compute() {
   const Pm = tables.prompt.cols;
   for (let i = 0; i < tables.prompt.n; i++) {
     const t = Pm.t[i];
-    if (t < pFrom || t >= to || !okP(Pm.p[i])) continue;
+    if (t < pFrom || t >= to || !okP(Pm.p[i], Pm.s[i])) continue;
     if (t < from) { if (t < pTo) A.prev.prompts++; continue; }
     A.prompts++;
     bump(A.promptSrc, dicts.src[Pm.src[i]] || 'typed', () => ({ n: 0 })).n++;
@@ -327,14 +381,14 @@ function compute() {
   const E = tables.evt.cols;
   for (let i = 0; i < tables.evt.n; i++) {
     const t = E.t[i];
-    if (t < from || t >= to || !okP(E.p[i])) continue;
+    if (t < from || t >= to || !okP(E.p[i], E.s[i])) continue;
     const k = dicts.kind[E.k[i]];
     bump(A.kinds, k, () => ({ n: 0 })).n++;
     if (k.startsWith('compact:')) { A.compactPre += E.x[i]; A.compactPost += E.y[i]; }
     else if (k === 'hooks') { A.hookRuns++; A.hookMs += E.x[i]; A.hookCount += E.y[i]; }
   }
   for (const [sIdx, m] of D.sessions) {
-    if (!m.cs || m.t0 < from || m.t0 >= to || !okP(m.p)) continue;
+    if (!m.cs || m.t0 < from || m.t0 >= to || !okP(m.p, sIdx)) continue;
     A.cc.cost += m.cs.cost; A.cc.n++; A.cc.add += m.cs.add || 0; A.cc.del += m.cs.del || 0;
     // accuracy check: logged cost up to the session's last saved counter vs that counter (no clock involved)
     const at = EST.attr.get(sIdx);
@@ -342,14 +396,23 @@ function compute() {
   }
   // month to date: same filters, calendar month, independent of the selected range
   const ms = new Date(); ms.setDate(1); ms.setHours(0, 0, 0, 0);
-  for (let i = 0; i < nR; i++) if (R.t[i] >= +ms && okP(R.p[i]) && okA(R.a[i]) && okM(R.m[i]) && (ui.advisor || !R.adv[i]) && R.cost[i] > 0) A.mtd += R.cost[i] * (useBg ? bgShare(EST, R.s[i], R.t[i])?.factor || 1 : 1);
+  for (let i = 0; i < nR; i++) if (R.t[i] >= +ms && okP(R.p[i], R.s[i]) && okA(R.a[i]) && okM(R.m[i]) && (ui.advisor || !R.adv[i]) && R.cost[i] > 0) A.mtd += R.cost[i] * (useBg ? bgShare(EST, R.s[i], R.t[i])?.factor || 1 : 1);
   A.monthStart = +ms;
   A.tok = A.in + A.out + A.cr + A.cw;
   A.hit = A.cr / (A.in + A.cr + A.cw || 1);
   A.prev.hit = A.prev.cr / (A.prev.inAll || 1);
   A.split = split; A.topP = topP; A.topA = topA; A.pFrom = pFrom; A.pTo = pTo;
+  // how the usage in view is billed, for wording outside the big number: one kind only, or a mix
+  const c = A.cls;
+  A.totalMode = c.api.cost > 0 ? (c.sub.cost + c.unknown.cost > 0 ? 'mixed' : 'api') : c.sub.cost > 0 ? 'sub' : 'unknown';
   return A;
 }
+// The noun for a cost figure outside the big number (README "Accounts and billing"): never "spend" on usage that is or
+// might be covered by a plan. full: headings and notes; short: column headers, tiles and labels.
+const costWord = (A) => ({
+  sub: { full: 'API-equivalent cost', short: 'API-eq. cost' }, api: { full: 'API spend (estimated)', short: 'API spend' },
+  mixed: { full: 'Cost at API prices', short: 'Cost' }, unknown: { full: 'Cost at API prices', short: 'Cost' },
+}[A.totalMode]);
 
 // Background spend: Claude Code's saved counter snapshots per session (a CounterState from the server) turned into
 // per-period factors by attribution() (public/machines.js). A period's share never changes once a later snapshot
@@ -370,18 +433,24 @@ function bgShare(EST, sIdx, t) {
   return k < 0 ? null : { factor: a.factors[k], frac: a.fracs[k] };
 }
 
-// ---------------------------------------------------------------- 5-hour windows (account-wide: ignores filters)
-let winCache = { v: -1 };
-function windows() {
-  if (winCache.v === D.version) return winCache;
+// ---------------------------------------------------------------- 5-hour windows (one account at a time: limits are per account)
+// Other filters are ignored, as a limit counts everything that account did. Sessions that recorded no account (older
+// Claude Code) are added, marked, since they may belong to it; their limit hits are drawn but never move a reset.
+// With no account to follow (none recorded anywhere), every call counts, as before accounts existed.
+let winCache = { v: '' };
+function windows(follow) {
+  const v = `${D.version}|${follow || ''}`;
+  if (winCache.v === v) return winCache;
   const R = D.tables.req.cols, n = D.tables.req.n, E = D.tables.evt.cols, kinds = D.dicts.kind;
-  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => R.t[a] - R.t[b]);
+  const keep = (s) => !follow || acctOf(s) === follow || acctOf(s) === 'none';
+  const unrec = (s) => !!follow && acctOf(s) === 'none';
+  const order = Array.from({ length: n }, (_, i) => i).filter((i) => keep(R.s[i])).sort((a, b) => R.t[a] - R.t[b]);
   const hits = [], anchorSet = new Set();
   for (let i = 0; i < D.tables.evt.n; i++) {
     const k = kinds[E.k[i]];
-    if (!k.startsWith('limit:')) continue;
-    hits.push({ t: E.t[i], kind: k.slice(6), reset: E.x[i] });
-    if (k === 'limit:five_hour' && E.x[i]) anchorSet.add(E.x[i]);
+    if (!k.startsWith('limit:') || !keep(E.s[i])) continue;
+    hits.push({ t: E.t[i], kind: k.slice(6), reset: E.x[i], unrec: unrec(E.s[i]) });
+    if (k === 'limit:five_hour' && E.x[i] && !unrec(E.s[i])) anchorSet.add(E.x[i]);
   }
   const anchors = [...anchorSet].sort((a, b) => a - b), H5 = 5 * 36e5;
   const blocks = []; let cb = null, ai = 0;
@@ -390,15 +459,16 @@ function windows() {
     while (ai < anchors.length && anchors[ai] <= t) ai++;
     const a = anchors[ai];
     if (a !== undefined && t >= a - H5) {
-      if (!cb || cb.end !== a) { cb = { start: a - H5, end: a, real: true, cost: 0, tok: 0, calls: 0, first: t, last: t }; blocks.push(cb); }
+      if (!cb || cb.end !== a) { cb = { start: a - H5, end: a, real: true, cost: 0, tok: 0, calls: 0, unrec: 0, first: t, last: t }; blocks.push(cb); }
     } else if (!cb || t >= cb.end) {
       const st = Math.floor(t / 6e5) * 6e5; // windows start on 10-minute marks (matches the real resets)
-      cb = { start: st, end: Math.min(st + H5, a !== undefined ? a - H5 : Infinity), real: false, cost: 0, tok: 0, calls: 0, first: t, last: t };
+      cb = { start: st, end: Math.min(st + H5, a !== undefined ? a - H5 : Infinity), real: false, cost: 0, tok: 0, calls: 0, unrec: 0, first: t, last: t };
       blocks.push(cb);
     }
     cb.cost += Math.max(0, R.cost[i]); cb.tok += R.in[i] + R.out[i] + R.cr[i] + R.cw5[i] + R.cw1[i]; cb.calls++; cb.last = t;
+    if (unrec(R.s[i])) cb.unrec++;
   }
-  winCache = { v: D.version, blocks, hits, anchors };
+  winCache = { v, blocks, hits, anchors };
   return winCache;
 }
 
@@ -419,6 +489,29 @@ function moveTip(e) {
   tip.style.transform = `translate(${Math.max(8, x)}px, ${Math.max(8, y)}px)`;
 }
 const hideTip = () => tip.removeAttribute('data-show');
+// Keyboard reading for charts whose values otherwise show only on hover: the chart is one tab stop; arrow keys walk its
+// points (Up/Down by a row when it has rows), each shown in the tooltip and announced to screen readers.
+// show(i) draws the highlight and returns { x, y, title, rows } in screen pixels; show(-1) clears it.
+function keyNav(host, n, show, cols = 0, start = n - 1) { // start: the point the first focus lands on
+  host.tabIndex = n ? 0 : -1;
+  const pick = (i) => {
+    host.kIdx = i;
+    const t = show(i); if (!t) return;
+    showTip({ clientX: t.x, clientY: t.y }, t.title, t.rows);
+    $('chart-sr').textContent = `${t.title}: ${t.rows.map((r) => `${r.label} ${r.value}`).join(', ')}`;
+  };
+  host.onkeydown = (e) => {
+    const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -cols, ArrowDown: cols }[e.key];
+    if (e.key === 'Home' || e.key === 'End') { e.preventDefault(); pick(e.key === 'Home' ? 0 : n - 1); return; }
+    if (!step || !n) return;
+    e.preventDefault();
+    pick(Math.max(0, Math.min(n - 1, (host.kIdx ?? start) + step)));
+  };
+  host.onfocus = () => { if (n) pick(Math.min(host.kIdx ?? start, n - 1)); };
+  host.onblur = () => { hideTip(); show(-1); };
+}
+// screen position of an SVG point, from the SVG's own size and its box on screen
+const svgPoint = (svg, W, H, x, y) => { const r = svg.getBoundingClientRect(); return { x: r.left + (x / W) * r.width, y: r.top + (y / H) * r.height }; };
 
 // ---------------------------------------------------------------- element sizes
 // Reading a size right after a DOM write forces a full page layout. Sizes only change when the layout does (page
@@ -448,7 +541,8 @@ function seg(id, options, value, onChange) {
       if (!['ArrowLeft', 'ArrowRight'].includes(e.key)) return;
       const btns = [...list.querySelectorAll('button:not(:disabled)')], i = btns.findIndex((b) => b.dataset.v === st.value);
       const nb = btns[(i + (e.key === 'ArrowRight' ? 1 : -1) + btns.length) % btns.length];
-      if (nb) { st.onChange(nb.dataset.v); requestAnimationFrame(() => list.querySelector(`[data-v="${nb.dataset.v}"]`)?.focus()); }
+      // keyboard changes jump: an action repeated key after key must not animate
+      if (nb) { st.act.style.transition = 'none'; st.onChange(nb.dataset.v); requestAnimationFrame(() => { list.querySelector(`[data-v="${nb.dataset.v}"]`)?.focus(); requestAnimationFrame(() => { st.act.style.transition = ''; }); }); }
       e.preventDefault();
     });
     fill(host, list, act);
@@ -525,17 +619,24 @@ function stackedBars(host, B, series, fmt, label) {
   fill(host, root);
 }
 
-function sparkline(host, B, values) {
-  const { w: W, h: H } = sizeOf(host, 600, 132), n = B.n, pad = 4;
+function sparkline(host, B, values, word) {
+  const { w: W, h: H } = sizeOf(host, 600, 132), n = B.n, pad = 4, bot = H - 16; // the time labels sit below bot
   const max = Math.max(...values, 0) || 1;
-  const x = (b) => (n === 1 ? W / 2 : pad + (b / (n - 1)) * (W - pad * 2)), y = (v) => H - 6 - (v / max) * (H - 18);
+  const x = (b) => (n === 1 ? W / 2 : pad + (b / (n - 1)) * (W - pad * 2)), y = (v) => bot - 6 - (v / max) * (bot - 18);
   const pts = Array.from(values, (v, b) => [x(b), y(v)]);
   const line = pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join('');
-  const root = s('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Spend per period' },
+  const root = s('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': `${word} per ${UNIT[B.unit]}` },
     s('defs', null, s('linearGradient', { id: 'sg', x1: 0, y1: 0, x2: 0, y2: 1 }, s('stop', { offset: '0%', 'stop-color': CATEGORICAL[0], 'stop-opacity': 0.28 }), s('stop', { offset: '100%', 'stop-color': CATEGORICAL[0], 'stop-opacity': 0 }))),
-    s('path', { d: `${line}L${pts.at(-1)[0]},${H}L${pts[0][0]},${H}Z`, fill: 'url(#sg)' }),
+    s('path', { d: `${line}L${pts.at(-1)[0]},${bot}L${pts[0][0]},${bot}Z`, fill: 'url(#sg)' }),
     s('path', { d: line, fill: 'none', stroke: CATEGORICAL[0], 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
-  const cross = s('line', { y1: 0, y2: H, class: 'xh', opacity: 0 });
+  // 2–4 time labels: first, last, and evenly spaced ones while each keeps twice its width (mono: ~6.4px a character)
+  const lw = 6.4 * Math.max(bucketLabel(B, 0, false).length, bucketLabel(B, n - 1, false).length);
+  const k = Math.min(n, Math.max(2, Math.min(4, 1 + Math.floor((W - pad * 2) / (2 * lw)))));
+  for (let i = 0; i < k; i++) {
+    const b = k === 1 ? 0 : Math.round((i * (n - 1)) / (k - 1));
+    root.append(s('text', { x: x(b), y: H - 3, 'text-anchor': k === 1 || (i && i < k - 1) ? 'middle' : i ? 'end' : 'start', text: bucketLabel(B, b, false) }));
+  }
+  const cross = s('line', { y1: 0, y2: bot, class: 'xh', opacity: 0 });
   const dot = s('circle', { r: 4.5, fill: CATEGORICAL[0], stroke: SURFACE, 'stroke-width': 2, opacity: 0 });
   root.append(cross, dot, s('rect', {
     class: 'hit', x: 0, y: 0, width: W, height: H,
@@ -544,25 +645,32 @@ function sparkline(host, B, values) {
       const b = Math.max(0, Math.min(n - 1, Math.round(n === 1 ? 0 : ((px - pad) / (W - pad * 2)) * (n - 1))));
       cross.setAttribute('x1', pts[b][0]); cross.setAttribute('x2', pts[b][0]); cross.setAttribute('opacity', 1);
       dot.setAttribute('cx', pts[b][0]); dot.setAttribute('cy', pts[b][1]); dot.setAttribute('opacity', 1);
-      showTip(e, bucketLabel(B, b, true), [{ label: 'Estimated spend', color: CATEGORICAL[0], value: usd(values[b]) }]);
+      showTip(e, bucketLabel(B, b, true), [{ label: word, color: CATEGORICAL[0], value: usd(values[b]) }]);
     },
     onpointerleave: () => { cross.setAttribute('opacity', 0); dot.setAttribute('opacity', 0); hideTip(); },
   }));
   fill(host, root);
+  keyNav(host, n, (b) => {
+    const on = b >= 0 ? 1 : 0;
+    cross.setAttribute('opacity', on); dot.setAttribute('opacity', on);
+    if (!on) return null;
+    cross.setAttribute('x1', pts[b][0]); cross.setAttribute('x2', pts[b][0]); dot.setAttribute('cx', pts[b][0]); dot.setAttribute('cy', pts[b][1]);
+    return { ...svgPoint(root, W, H, pts[b][0], pts[b][1]), title: bucketLabel(B, b, true), rows: [{ label: word, color: CATEGORICAL[0], value: usd(values[b]) }] };
+  });
 }
 
-// bar list: items {key, label, small, color, value, sub, share, meta, title, pressed}
+// bar list: items {key, label, small, color, value, sub, share, meta, title, pressed, noClick}
 function barList(host, id, items, { onClick, limit = 8, fillColor = null } = {}) {
   if (!items.length) { fill(host, h('p', { class: 'empty', text: 'Nothing in this range.' })); return; }
   const open = expanded.has(id), shown = open ? items : items.slice(0, limit);
-  fill(host, shown.map((it) => h(onClick ? 'button' : 'div', {
-    class: 'bar', type: onClick ? 'button' : null, title: it.title || null, 'aria-pressed': onClick ? String(!!it.pressed) : null, onclick: onClick ? () => onClick(it) : null,
-    'data-fk': onClick ? `${id}:${it.key}` : null,
+  fill(host, shown.map((it) => { const btn = onClick && !it.noClick; return h(btn ? 'button' : 'div', { // noClick: a row that filters nothing is no button
+    class: 'bar', type: btn ? 'button' : null, title: it.title || null, 'aria-pressed': btn ? String(!!it.pressed) : null, onclick: btn ? () => onClick(it) : null,
+    'data-fk': btn ? `${id}:${maskPath(String(it.key))}` : null, // a project key is a path: masked while presenting
   },
   h('div', { class: 'name' }, it.color ? h('i', { class: 'sw', style: { background: it.color } }) : null, h('span', { text: it.label }), it.small ? h('small', { text: it.small }) : null),
   h('div', { class: 'v' }, it.value, it.sub ? h('small', { text: it.sub }) : null),
   h('div', { class: 'track' }, h('i', { style: { width: Math.max(0.5, Math.min(100, it.share * 100)) + '%', ...((it.color || it.fillColor || fillColor) ? { background: it.color || it.fillColor || fillColor } : {}) } })),
-  it.meta ? h('div', { class: 'meta' }, it.meta) : null)),
+  it.meta ? h('div', { class: 'meta' }, it.meta) : null); }),
   items.length > limit ? h('button', { class: 'btn btn-ghost btn-sm more', type: 'button', onclick: () => { open ? expanded.delete(id) : expanded.add(id); render(); }, text: open ? 'Show fewer' : `Show all ${items.length}` }) : null);
 }
 
@@ -575,33 +683,59 @@ const delta = (curV, prevV) => {
 };
 
 function renderHero(A) {
-  const [dollars, cents] = usd(A.cost).split('.');
+  // The big number shows each kind of usage for what it is: per-token spend when there is any, otherwise what the
+  // (subscription or unknown) usage would cost at API prices. Never "spend" on usage that is or might be covered.
+  const C = A.cls, api = C.api.cost, sub = C.sub.cost, unk = C.unknown.cost;
+  const mode = api > 0 ? 'api' : sub > 0 ? 'sub' : 'unknown';
+  const big = mode === 'api' ? C.api : { cost: A.cost, prev: A.prev.cost - C.api.prev, calls: A.calls, logged: A.logged, bg: A.bg, spark: A.spark };
+  $('spend-h').textContent = { api: 'API spend (estimated)', sub: 'API-equivalent cost', unknown: 'Estimated cost at API prices' }[mode];
+  const [dollars, cents] = usd(big.cost).split('.');
   fill($('spend-num'), dollars, h('span', { class: 'cents', text: '.' + cents }));
-  $('spend-range').textContent = `${liveEnd() ? `${fDateTime.format(A.from)} → now (live)` : rangeText(A.from, A.to)} · by ${UNIT[A.B.unit]}`;
-  const dl = delta(A.cost, A.prev.cost), el = $('spend-delta');
-  if (dl) fill(el, icon(dl.d >= 0 ? 'M7 17 17 7M9 7h8v8' : 'M7 7l10 10M17 9v8H9'), `${dl.text} vs ${PREV[ui.range]}`); else fill(el, 'No earlier data to compare');
-  fill($('spend-sub'),
-    'API list prices for ', h('b', { text: int(A.calls) }), ' logged calls', A.bg ? [' (', h('b', { text: usd(A.logged) }), '), plus ', h('b', { text: usd(A.bg) }), ' of background calls that Claude Code billed but never logged, taken from the cost counters it saves in each session.'] : '.',
+  $('spend-range').textContent = `${liveEnd() ? `${fDateTime.format(A.from)} → now (live)` : rangeText(A.from, A.to)} · by ${UNIT[A.B.unit]}${filterChips().length ? ' · filtered' : ''}`;
+  // the same kinds of usage in the previous period; the base is shown, since "13×" alone reads as alarming
+  const dl = delta(big.cost, big.prev), el = $('spend-delta');
+  if (dl) fill(el, icon(dl.d >= 0 ? 'M7 17 17 7M9 7h8v8' : 'M7 7l10 10M17 9v8H9'), `${dl.text} vs ${PREV[ui.range]} (${usd(big.prev)})`); else fill(el, 'No earlier data to compare');
+  const unkWhy = [A.unk.noKey ? 'No account was recorded for some sessions (Claude Code before 2.1.317, or an API key: mark API-key projects in Filters → Billing).' : '', A.unk.noPlan ? 'Plan not known yet for an account: open the dashboard once while logged into it.' : ''].filter(Boolean).join(' ');
+  const what = {
+    sub: ['What this usage would cost at API list prices. Your plan covers it up to its limits.', unk ? ` ${usd(unk)} of it is from sessions whose billing isn't known.` : ''],
+    api: ['At API list prices; your invoice may differ.', sub || unk ? ` Plus ${[sub ? `${usd(sub)} of subscription usage` : '', unk ? `${usd(unk)} unknown` : ''].filter(Boolean).join(' and ')}; total at API prices ${usd(A.cost)}.` : ''],
+    unknown: [A.cost ? unkWhy : ''],
+  }[mode];
+  fill($('spend-sub'), what, ' ',
+    what.join('') ? 'From ' : 'API list prices for ', h('b', { text: int(big.calls) }), ' logged calls', big.bg ? [' (', h('b', { text: usd(big.logged) }), '), plus ', h('b', { text: usd(big.bg) }), ' of background calls that Claude Code counted but never logged, taken from the cost counters it saves in each session.'] : '.',
     !A.bg && ui.background && (ui.models.length || !ui.subagents || !ui.advisor) ? ' Background calls are left out while a model or agent filter is on.' : null,
     A.unpriced ? ` ${int(A.unpriced)} calls use a model with no known price and count as $0.` : null);
-  sparkline($('spark'), A.B, A.spark);
+  sparkline($('spark'), A.B, big.spark, { api: 'API spend', sub: 'API-eq. cost', unknown: 'Cost at API prices' }[mode]);
 }
 
 function renderKpis(A) {
-  const P = A.prev;
+  const P = A.prev, word = costWord(A).short;
+  // turns and prompts aren't per model or agent: those filters can't narrow two of the tiles, so they say so
+  const allM = ui.models.length || !ui.subagents || !ui.advisor, scope = () => (allM ? h('div', { class: 'kpi-scope', text: 'all models & agents' }) : null);
   const tile = (label, val, sub, dl, extra) => h('div', { class: 'kpi' },
     h('div', { class: 'label' }, h('span', { text: label }), dl ? h('span', { class: 'd', text: dl.text }) : null),
-    h('div', { class: 'val', text: val }), sub ? h('div', { class: 'sub', text: sub }) : null, extra || null);
+    h('div', { class: 'val', text: val }), sub ? h('div', { class: 'sub', text: sub, title: sub }) : null, extra || null); // title: the line is cut off on narrow tiles
   const tokParts = [['out', A.out], ['in', A.in], ['cw', A.cw], ['cr', A.cr]];
   fill($('kpi-grid'),
     tile('Tokens', num(A.tok), `${num(A.out)} out · ${num(A.in + A.cw)} in · ${num(A.cr)} cached`, delta(A.tok, P.tok), [
       h('div', { class: 'mini-stack', title: 'Output · input · cache write · cache read' }, tokParts.map(([k, v]) => h('i', { style: { flex: String(Math.max(v, A.tok * 0.004)), background: TOKEN_COLORS[k] } }))),
-      A.rawTok > A.tok * 1.05 ? h('div', { class: 'sub', title: 'Claude Code writes one API reply as several log lines that repeat the same usage. Counting every line inflates the total (it lands close to what Claude Code’s /stats showed). This dashboard counts each reply once, which agrees with Claude Code’s own cost counter.', text: `every-line count: ${num(A.rawTok)} (${(A.rawTok / A.tok).toFixed(1)}× lines)` }) : null]),
+      // a live refresh rebuilds the tiles: the note keeps its open state and keyboard focus
+      A.rawTok > A.tok * 1.05 ? h('details', { class: 'explain', open: expanded.has('kpi:why') || null, ontoggle: (e) => { e.target.open ? expanded.add('kpi:why') : expanded.delete('kpi:why'); } },
+        h('summary', { 'data-fk': 'kpi:why', text: `every-line count: ${num(A.rawTok)} (${(A.rawTok / A.tok).toFixed(1)}× lines)` }),
+        h('p', { class: 'foot-note', text: 'Claude Code writes one API reply as several log lines that repeat the same usage. Counting every line inflates the total (close to what Claude Code’s /stats showed). This dashboard counts each reply once, which agrees with Claude Code’s own cost counter.' })) : null]),
     tile('API calls', int(A.calls), A.adv ? `${int(A.adv)} advisor calls` : `${int(A.toolCalls)} tool calls`, delta(A.calls, P.calls)),
-    tile('Sessions', int(A.sessions.size), A.sessions.size ? `${usd(A.cost / A.sessions.size)} per session` : '–', delta(A.sessions.size, P.sess.size)),
-    tile('Claude working', dur(A.active), A.turns ? `${dur(unionMs(A.turnIv || []))} on the clock · ${int(A.turns)} turns · longest ${dur(A.longest)}` : 'No completed turns', delta(A.active, P.active)),
-    tile('Your prompts', int(A.prompts), A.prompts ? `${usd(A.cost / A.prompts)} and ${(A.calls / A.prompts).toFixed(1)} API calls each` : '–', delta(A.prompts, P.prompts)),
-    tile('Cache hit rate', pct(A.hit, 1), `caching saved ≈ ${usd(A.saved)}`, P.inAll ? { text: `${A.hit >= P.hit ? '+' : '−'}${Math.abs((A.hit - P.hit) * 100).toFixed(1)} pt` } : null));
+    tile('Sessions', int(A.sessions.size), A.sessions.size ? `${word} ${usd(A.cost / A.sessions.size)} per session` : '–', delta(A.sessions.size, P.sess.size)),
+    tile('Claude working', dur(A.active), A.turns ? `${dur(unionMs(A.turnIv || []))} on the clock · ${int(A.turns)} turns · longest ${dur(A.longest)}` : 'No completed turns', delta(A.active, P.active), scope()),
+    // under those filters both ratios would divide filtered cost and calls by unfiltered prompts
+    tile('Your prompts', int(A.prompts), allM ? null : A.prompts ? `${word} ${usd(A.cost / A.prompts)} and ${(A.calls / A.prompts).toFixed(1)} calls each` : '–', delta(A.prompts, P.prompts), scope()),
+    tile('Cache hit rate', pct(A.hit, 1), `caching saved ≈ ${usd(A.saved)} at API prices`, P.inAll ? { text: `${A.hit >= P.hit ? '+' : '−'}${Math.abs((A.hit - P.hit) * 100).toFixed(1)} pt` } : null),
+    monthTile(A));
+}
+// this calendar month, whatever the range: one full-width line under the tiles (same filters as everything else)
+function monthTile(A) {
+  const now = new Date(), elapsed = (now - A.monthStart) / 864e5, inMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  return h('div', { class: 'kpi month' }, h('div', { class: 'label' }, h('span', { text: 'This month · at API prices' })), h('div', { class: 'val', text: usd(A.mtd) }),
+    h('div', { class: 'sub', text: elapsed > 0.25 ? `since ${fDay.format(A.monthStart)} · heading for ${usd((A.mtd / elapsed) * inMonth)}` : `since ${fDay.format(A.monthStart)}` }));
 }
 
 function usageSeries(A) {
@@ -621,7 +755,7 @@ function usageSeries(A) {
 }
 
 function renderUsage(A) {
-  seg('metric', [{ v: 'cost', label: 'Spend' }, { v: 'tokens', label: 'Tokens' }, { v: 'calls', label: 'Calls' }], ui.metric, (v) => set({ metric: v }));
+  seg('metric', [{ v: 'cost', label: 'Cost' }, { v: 'tokens', label: 'Tokens' }, { v: 'calls', label: 'Calls' }], ui.metric, (v) => set({ metric: v }));
   seg('split', [{ v: 'model', label: 'Model' }, { v: 'tokens', label: 'Token type', disabled: ui.metric === 'calls' }, { v: 'project', label: 'Project' }, { v: 'agent', label: 'Agent' }], A.split, (v) => set({ split: v }));
   const series = usageSeries(A);
   const fmt = ui.metric === 'cost' ? (v, long) => (long ? usd(v) : usdShort(v)) : (v, long) => (long ? int(v) : num(v));
@@ -646,76 +780,138 @@ function renderModels(A) {
   const d = D.dicts, total = A.cost || 1;
   const items = [...A.models.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([m, x]) => ({
     key: d.model[m], label: modelName(d.model[m]), color: modelColor(d.model[m]), value: usd(x.cost), sub: pct(x.cost / total), share: x.cost / total,
-    meta: [h('span', { text: `${int(x.calls)} calls` }), h('span', { text: `${num(x.tok)} tokens` }), h('span', { text: `${num(x.out)} out` })],
+    meta: [h('span', { text: nCalls(x.calls) }), h('span', { text: `${num(x.tok)} tokens` }), h('span', { text: `${num(x.out)} out` })],
     pressed: ui.models.includes(d.model[m]), title: d.model[m],
   }));
   // unlogged background spend: shown as its own row, never folded into a model it may not belong to
   if (A.bg > 0) {
     // split by model from Claude Code's own per-model counter (exact per session; spread over time like the rest)
     const parts = [...A.bgModels].sort((x, y) => y[1] - x[1]).slice(0, 3).map(([name, c]) => h('span', { text: `${modelName(name)} ${usd(c)}` }));
-    items.push({ key: '', label: 'Background (not in logs)', color: OTHER, value: usd(A.bg), sub: pct(A.bg / total), share: A.bg / total,
-      title: 'Spend in Claude Code’s own counter that its transcripts do not contain. Measured on your logs: about one short extra call per turn on your main model that re-reads the whole cached conversation (likely an after-turn helper such as prompt suggestions), small Haiku helper calls on uncached input, and requests whose reply was never written. See Data & accuracy.',
-      meta: parts.length ? parts : [h('span', { text: 'billed by Claude Code, never written to the transcript' })] });
+    items.push({ key: '', noClick: true, label: 'Background (not in logs)', color: OTHER, value: usd(A.bg), sub: pct(A.bg / total), share: A.bg / total,
+      meta: parts.length ? parts : [h('span', { text: 'counted by Claude Code, never written to the transcript' })] });
   }
-  barList($('model-bars'), 'models', items, { onClick: (it) => { if (it.key) set({ models: toggleIn(ui.models, it.key) }); } });
+  const host = $('model-bars'), noteOpen = host.querySelector('.explain')?.open; // a live update must not fold the note while it is read
+  barList(host, 'models', items, { onClick: (it) => { if (it.key) set({ models: toggleIn(ui.models, it.key) }); } });
+  // the background row's explanation, reachable by keyboard and touch (a tooltip is neither)
+  if (A.bg > 0) host.append(h('details', { class: 'explain', open: noteOpen || null }, h('summary', { 'data-fk': 'models:bg-note', text: 'What “Background (not in logs)” is' }),
+    h('p', { class: 'foot-note', text: 'Cost in Claude Code’s own counter that its transcripts do not contain. Measured on your logs: about one short extra call per turn on your main model that re-reads the whole cached conversation (likely an after-turn helper such as prompt suggestions), small Haiku helper calls on uncached input, and requests whose reply was never written. See Data & accuracy.' })));
+}
+
+// Time axis under the 5-hour timeline: round clock times (the date at midnight) or whole days, from the range's own
+// buckets; at most 3 to 5 by width, one step finer when fewer than 3 land, and a label that would touch the one before it
+// is left out.
+function wTicks(B, from, to, width, X) {
+  const unitMin = { m5: 5, m15: 15, hour: 60 }[B.unit], most = Math.max(3, Math.min(5, Math.floor(width / 110)));
+  const edges = B.edges.filter((t) => t >= from && t < to);
+  if (!edges.length) return [];
+  // minute and hour buckets: a clock step in minutes; day and week buckets: every Nth one
+  const steps = unitMin ? [5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440].filter((x) => x % unitMin === 0) : edges.map((_, i) => i + 1);
+  const at = (step) => {
+    const out = []; let right = -Infinity;
+    edges.forEach((t, i) => {
+      const d = new Date(t);
+      if (unitMin ? (d.getHours() * 60 + d.getMinutes()) % step : i % step) return;
+      // past 24 hours a clock time can repeat, so it carries its date; 10.5px mono is 0.6em a character
+      const text = !unitMin || t === dayStart(t) ? fDay.format(t) : (to - from > 864e5 ? fDateTime : fTime).format(t), w = text.length * 6.4, x = X(t);
+      const anchor = x - w / 2 < 0 ? 'start' : x + w / 2 > width ? 'end' : 'middle', left = { start: x, middle: x - w / 2, end: x - w }[anchor];
+      if (left < right + 8) return;
+      right = left + w;
+      out.push({ x, text, anchor });
+    });
+    return out;
+  };
+  const fit = steps.findIndex((x) => (unitMin ? x * 6e4 * most >= to - from : x * most >= edges.length)), i = fit < 0 ? steps.length - 1 : fit;
+  const out = at(steps[i]), finer = out.length < 3 && i > 0 && at(steps[i - 1]);
+  return finer && finer.length > out.length && finer.length <= 5 ? finer : out;
 }
 
 function renderWindows(A) {
-  const W = windows(), now = Date.now(), H5 = 5 * 36e5;
+  // limits are per account: follow the one picked in Filters, else the current login, else the most used in range
+  const use = new Map(); for (const [s, x] of A.sessions) use.set(acctOf(s), (use.get(acctOf(s)) || 0) + x.cost);
+  const follow = followAccount(ui.accounts, D.meta.account?.key, use);
+  const followNote = follow ? `Following ${accountLabel(follow)} (${ui.accounts.filter((k) => k !== 'none').length === 1 ? 'picked in Filters' : follow === D.meta.account?.key ? 'current login' : 'most used in this range'}). ` : '';
+  const state = $('window-state'), fcls = follow ? billingClass(acctMem[follow], true, false) : null;
+  $('window-filtered').hidden = !filterChips().length || fcls === 'api'; // a limit counts everything the account did
+  if (fcls === 'api') {
+    delete state.dataset.tone; fill(state, 'No limit');
+    fill($('window-now'), h('p', { class: 'empty', text: 'No 5-hour limit on per-token billing.' }));
+    fill($('window-chart')); keyNav($('window-chart'), 0, () => null); fill($('window-note'), followNote);
+    return;
+  }
+  // a plan meets limits, not bills: lead with the limit, its dollars as API-equivalent context. The money is the followed
+  // account's (no filters), so its class names it; the view's mix only when no account is followed.
+  const plan = fcls === 'sub' || A.totalMode === 'sub', cw = costWord({ totalMode: plan ? 'sub' : fcls || A.totalMode });
+  const W = windows(follow), now = Date.now(), H5 = 5 * 36e5;
+  // hits from sessions with no account recorded may be another account's: counted apart
+  const hits = W.hits.filter((x) => x.t >= A.from && x.t < A.to), count = (k, unrec) => hits.filter((x) => x.kind === k && x.unrec === unrec).length;
+  const h5 = count('five_hour', false), h7 = count('seven_day', false), u5 = count('five_hour', true), uh = hits.filter((x) => x.unrec).length;
+  const stat = (k, v, sub) => h('div', null, h('span', { class: 'k', text: k }), h('span', { class: 'v', text: v }), h('span', { class: 's', text: sub }));
+  const hitStat = plan && stat('5-hour limit hits', int(h5), ['in this range', h7 && `${int(h7)} seven-day`, u5 && `${int(u5)} more, account not recorded`].filter(Boolean).join(' · '));
   const curB = W.blocks.at(-1), active = curB && now < curB.end && now >= curB.start;
-  const state = $('window-state');
   if (active) {
     state.dataset.tone = 'good'; fill(state, `Active · resets ${fTime.format(curB.end)}`);
-    const elapsed = now - curB.start, left = curB.end - now, rate = curB.cost / Math.max(elapsed, 6e5) * 36e5;
-    fill($('window-now'), h('div', { class: 'win' },
-      h('div', null, h('span', { class: 'k', text: 'This window' }), h('span', { class: 'v', text: usd(curB.cost) }), h('span', { class: 's', text: `${int(curB.calls)} calls · ${num(curB.tok)} tokens` })),
-      h('div', null, h('span', { class: 'k', text: 'Burn rate' }), h('span', { class: 'v', text: usd(rate) + '/h' }), h('span', { class: 's', text: `${dur(left)} left` })),
-      h('div', null, h('span', { class: 'k', text: 'Projected at reset' }), h('span', { class: 'v', text: usd(curB.cost + rate * left / 36e5) }), h('span', { class: 's', text: curB.real ? 'window from a real reset' : 'estimated window' }))),
+    const elapsed = now - curB.start, left = curB.end - now, rate = curB.cost / Math.max(elapsed, 6e5) * 36e5, byReset = usd(curB.cost + rate * left / 36e5);
+    const work = `${nCalls(curB.calls)} · ${num(curB.tok)} tokens`;
+    fill($('window-now'), h('div', { class: 'win' }, plan
+      ? [stat('Resets in', dur(left), `${work} so far`), hitStat, stat(`${cw.short} this window`, usd(curB.cost), `${usd(rate)}/h, ${byReset} by reset at this rate`)]
+      : [stat(`${cw.short} this window`, usd(curB.cost), work), stat(`${cw.short} rate`, usd(rate) + '/h', `${dur(left)} left`), stat(`${cw.short} by reset`, byReset, 'at this rate')]),
     h('div', { class: 'progress', role: 'progressbar', 'aria-label': 'Window elapsed', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(Math.round(elapsed / H5 * 100)) }, h('i', { style: { transform: `scaleX(${Math.min(1, elapsed / (curB.end - curB.start))})` } })),
-    h('p', { class: 'foot-note', text: `${fTime.format(curB.start)} → ${fTime.format(curB.end)}` }));
+    h('p', { class: 'foot-note', text: `${fTime.format(curB.start)} → ${fTime.format(curB.end)} · ${curB.real ? 'window from a real reset' : 'estimated window'}` }));
   } else {
     delete state.dataset.tone; fill(state, 'Idle');
-    fill($('window-now'), curB ? h('div', { class: 'win' },
-      h('div', null, h('span', { class: 'k', text: 'Last window' }), h('span', { class: 'v', text: usd(curB.cost) }), h('span', { class: 's', text: `ended ${ago(Math.min(curB.end, now))}` })),
-      h('div', null, h('span', { class: 'k', text: 'Calls' }), h('span', { class: 'v', text: int(curB.calls) }), h('span', { class: 's', text: `${num(curB.tok)} tokens` })),
-      h('div', null, h('span', { class: 'k', text: 'Next window' }), h('span', { class: 'v', text: 'on first call' }), h('span', { class: 's', text: 'starts a fresh 5 hours' }))) : h('p', { class: 'empty', text: 'No windows yet.' }));
+    const ended = curB && `ended ${ago(Math.min(curB.end, now))}`, next = stat('Next window', 'on first call', 'starts a fresh 5 hours');
+    fill($('window-now'), !curB ? h('p', { class: 'empty', text: 'No windows yet.' }) : h('div', { class: 'win' }, plan
+      ? [hitStat, next, stat(`${cw.short} last window`, usd(curB.cost), `${nCalls(curB.calls)} · ${ended}`)]
+      : [stat(`${cw.short} last window`, usd(curB.cost), ended), stat('Calls', int(curB.calls), `${num(curB.tok)} tokens`), next]));
   }
-  // timeline of windows in range
-  const host = $('window-chart'), { w: Wd, h: Hd } = sizeOf(host, 400, 116), m = { l: 2, r: 2, t: 6, b: 18 };
+  // timeline of windows in range; under its baseline, the limit-hit markers, then the time axis
+  const host = $('window-chart'), { w: Wd, h: Hd } = sizeOf(host, 400, 128), m = { l: 2, r: 2, t: 6, b: 30 }, y0 = Hd - m.b;
   const inR = W.blocks.filter((b) => b.end > A.from && b.start < A.to);
-  const hits = W.hits.filter((x) => x.t >= A.from && x.t < A.to);
   const max = Math.max(...inR.map((b) => b.cost), 0.01);
   const X = (t) => m.l + ((t - A.from) / (A.to - A.from)) * (Wd - m.l - m.r);
   const root = s('svg', { viewBox: `0 0 ${Wd} ${Hd}`, role: 'img', 'aria-label': 'Five-hour windows in range' },
-    s('line', { x1: m.l, x2: Wd - m.r, y1: Hd - m.b, y2: Hd - m.b, class: 'gl0' }));
+    s('line', { x1: m.l, x2: Wd - m.r, y1: y0, y2: y0, class: 'gl0' }),
+    wTicks(A.B, A.from, A.to, Wd, X).map((k) => [s('line', { x1: k.x, x2: k.x, y1: y0, y2: y0 + 4, class: 'gl0' }), s('text', { x: k.x, y: Hd - 3, 'text-anchor': k.anchor, text: k.text })]));
+  const marks = [];
   for (const b of inR) {
-    const x0 = Math.max(m.l, X(b.start)), x1 = Math.min(Wd - m.r, X(b.end)), w = Math.max(2, x1 - x0 - 2), hh = Math.max(2, (b.cost / max) * (Hd - m.t - m.b));
-    root.append(s('path', {
-      d: roundTop(x0 + 1, Hd - m.b - hh, w, hh, 3), fill: CATEGORICAL[0], 'fill-opacity': b.real ? 0.95 : 0.55,
-      onpointerenter: (e) => showTip(e, `${fDateTime.format(b.start)} → ${fTime.format(b.end)}`, [{ label: 'Spend', value: usd(b.cost) }, { label: 'Calls', value: int(b.calls) }, { label: 'Tokens', value: num(b.tok) }, { label: 'Window', value: b.real ? 'real reset' : 'estimated' }]),
-      onpointermove: moveTip, onpointerleave: hideTip,
-    }));
+    const x0 = Math.max(m.l, X(b.start)), x1 = Math.min(Wd - m.r, X(b.end)), w = Math.max(2, x1 - x0 - 2), hh = Math.max(2, (b.cost / max) * (y0 - m.t));
+    const allUnrec = b.unrec === b.calls; // only sessions with no account recorded: may not be this account's at all
+    const title = `${fDateTime.format(b.start)} → ${fTime.format(b.end)}`, rows = [{ label: cw.short, value: usd(b.cost) }, { label: 'Calls', value: int(b.calls) }, { label: 'Tokens', value: num(b.tok) }, { label: 'Window', value: b.real ? 'real reset' : 'estimated' },
+      ...(b.unrec ? [{ label: 'Account', value: allUnrec ? 'not recorded' : `${int(b.unrec)} calls not recorded` }] : [])];
+    const el = s('path', { d: roundTop(x0 + 1, y0 - hh, w, hh, 3), fill: CATEGORICAL[0], 'fill-opacity': allUnrec ? 0.22 : b.real ? 0.95 : 0.55,
+      onpointerenter: (e) => showTip(e, title, rows), onpointermove: moveTip, onpointerleave: hideTip });
+    root.append(el);
+    marks.push({ el, cx: x0 + 1 + w / 2, top: y0 - hh, title, rows });
   }
   for (const x of hits) {
     const cx = X(x.t);
     root.append(s('path', {
-      d: `M${cx - 5},${Hd - 4}L${cx + 5},${Hd - 4}L${cx},${Hd - 12}Z`, fill: STATUS.critical,
-      onpointerenter: (e) => showTip(e, `Hit the ${x.kind.replace('_', '-')} limit`, [{ label: 'At', value: fDateTime.format(x.t) }, { label: 'Resets', value: x.reset ? fDateTime.format(x.reset) : '–' }]),
+      d: `M${cx - 5},${y0 + 14}L${cx + 5},${y0 + 14}L${cx},${y0 + 6}Z`, fill: STATUS.critical, 'fill-opacity': x.unrec ? 0.4 : 1,
+      onpointerenter: (e) => showTip(e, `Hit the ${x.kind.replace('_', '-')} limit`, [{ label: 'At', value: fDateTime.format(x.t) }, { label: 'Resets', value: x.reset ? fDateTime.format(x.reset) : '–' }, ...(x.unrec ? [{ label: 'Account', value: 'not recorded' }] : [])]),
       onpointermove: moveTip, onpointerleave: hideTip,
     }));
   }
   fill(host, root);
-  const h5 = hits.filter((x) => x.kind === 'five_hour').length, h7 = hits.filter((x) => x.kind === 'seven_day').length;
-  fill($('window-note'), `${inR.length} windows in range`, h5 || h7 ? ` · limit hits: ${h5} five-hour, ${h7} seven-day (red markers)` : ' · no limit hits',
-    `. Windows come from CLI activity and snap to ${W.anchors.length} real resets; claude.ai chats share the same limit but aren’t in these logs, so solid bars are exact and faded ones are estimates.`);
+  keyNav(host, marks.length, (i) => {
+    for (const k of marks) k.el.removeAttribute('stroke');
+    if (i < 0) return null;
+    const k = marks[i]; k.el.setAttribute('stroke', 'currentColor'); k.el.setAttribute('stroke-width', '2');
+    return { ...svgPoint(root, Wd, Hd, k.cx, k.top), title: k.title, rows: k.rows };
+  });
+  fill($('window-note'), followNote, `${inR.length} window${inR.length === 1 ? '' : 's'} in range`, h5 || h7 || uh ? ` · limit hits: ${h5} five-hour, ${h7} seven-day${uh ? `, ${uh} from sessions with no account recorded` : ''} (red markers)` : ' · no limit hits',
+    `. Windows come from CLI activity and snap to ${W.anchors.length} real resets; claude.ai chats share the same limit but aren’t in these logs, so solid bars are exact and faded ones are estimates`,
+    inR.some((b) => b.unrec) ? '; the lightest bars are sessions with no account recorded (Claude Code before 2.1.317).' : '.');
 }
 
 // ---------------------------------------------------------------- API billing breakdown
 function renderBilling(A) {
   const d = D.dicts;
-  const COLS = [['in', 'cIn', 'Input', (p) => p[0]], ['cw5', 'cCw5', 'Cache write 5 min', (p) => p[0] * 1.25], ['cw1', 'cCw1', 'Cache write 1 h', (p) => p[0] * 2], ['cr', 'cCr', 'Cache read', (p) => p[2]], ['out', 'cOut', 'Output', (p) => p[1]]];
+  const ALL = [['in', 'cIn', 'Input', (p) => p[0]], ['cw5', 'cCw5', 'Cache write 5 min', (p) => p[0] * 1.25], ['cw1', 'cCw1', 'Cache write 1 h', (p) => p[0] * 2], ['cr', 'cCr', 'Cache read', (p) => p[2]], ['out', 'cOut', 'Output', (p) => p[1]]];
   const total = (b) => b.cIn + b.cCw5 + b.cCw1 + b.cCr + b.cOut + b.cWs;
   const rows = [...A.bill.entries()].sort((x, y) => total(y[1]) - total(x[1]));
+  billRows = rows; // for the CSV
+  // a token type nobody used in this range is a column of zeros: leave it out (the totals don't change)
+  const COLS = ALL.filter(([k]) => rows.some(([, b]) => b[k] > 0)), hasWs = rows.some(([, b]) => b.ws > 0);
   const sum = { calls: 0, ws: 0, cWs: 0 }; for (const [k] of COLS) { sum[k] = 0; }
   const rate = (v) => '$' + (v >= 1 ? v.toFixed(2).replace(/\.00$/, '') : v.toFixed(3).replace(/0$/, '')) + '/MTok';
   const cell = (tokens, cost, title) => h('td', { class: 'r', title }, h('b', { text: int(tokens) }), h('small', { text: cost == null ? 'no price' : usd(cost) }));
@@ -728,21 +924,21 @@ function renderBilling(A) {
         h('div', { class: 'sub', text: pr ? `${rate(pr[0])} in · ${rate(pr[1])} out · ${rate(pr[2])} read` : 'model has no known price' })),
       h('td', { class: 'r', text: int(b.calls) }),
       COLS.map(([k, c, label, r]) => cell(b[k], pr ? b[c] : null, pr ? `${label}: ${int(b[k])} tokens × ${rate(r(pr))}${b.fast ? ' (fast-mode calls ×2)' : ''}` : '')),
-      cell(b.ws, pr ? b.cWs : null, 'Web searches × $0.01'),
+      hasWs ? cell(b.ws, pr ? b.cWs : null, 'Web searches × $0.01') : null,
       h('td', { class: 'r' }, h('b', { text: pr ? usd(total(b)) : '–' }), h('small', { text: b.fast ? `${int(b.fast)} fast-mode calls` : b.tier ? `${int(b.tier)} over 100K` : '' })));
   });
   const grand = COLS.reduce((x, [, c]) => x + (sum[c] || 0), 0) + sum.cWs;
   fill($('bill-table'),
-    h('thead', null, h('tr', null, h('th', { text: 'Model' }), h('th', { class: 'r', text: 'Calls' }), COLS.map(([, , label]) => h('th', { class: 'r', text: label })), h('th', { class: 'r', text: 'Web search' }), h('th', { class: 'r', text: 'Cost' }))),
-    h('tbody', null, body.length ? body : h('tr', null, h('td', { colspan: '9', class: 'dim', text: 'No API calls in this range.' }))),
+    h('thead', null, h('tr', null, h('th', { text: 'Model' }), h('th', { class: 'r', text: 'Calls' }), COLS.map(([, , label]) => h('th', { class: 'r', text: label })), hasWs ? h('th', { class: 'r', text: 'Web search' }) : null, h('th', { class: 'r', text: 'Cost' }))),
+    h('tbody', null, body.length ? body : h('tr', null, h('td', { colspan: String(COLS.length + (hasWs ? 4 : 3)), class: 'dim', text: 'No API calls in this range.' }))),
     body.length > 1 ? h('tfoot', null, h('tr', null, h('td', { text: 'Total' }), h('td', { class: 'r', text: int(sum.calls) }),
-      COLS.map(([k, c]) => cell(sum[k], sum[c] || 0)), cell(sum.ws, sum.cWs), h('td', { class: 'r' }, h('b', { text: usd(grand) })))) : null);
+      COLS.map(([k, c]) => cell(sum[k], sum[c] || 0)), hasWs ? cell(sum.ws, sum.cWs) : null, h('td', { class: 'r' }, h('b', { text: usd(grand) })))) : null);
   // the split must add back up to the logged spend shown everywhere else
   const diff = Math.abs(grand - A.logged), tag = $('billing-check');
   tag.dataset.tone = diff < 0.005 ? 'good' : 'warn';
-  fill(tag, icon(diff < 0.005 ? 'M5 12.5l4.5 4.5L19 7.5' : 'M12 8v5m0 3.5v.01'), diff < 0.005 ? `adds up to logged spend, ${usd(A.logged)}` : `differs from logged spend by ${usd(diff)}`);
+  fill(tag, icon(diff < 0.005 ? 'M5 12.5l4.5 4.5L19 7.5' : 'M12 8v5m0 3.5v.01'), diff < 0.005 ? `adds up to logged cost, ${usd(A.logged)}` : `differs from logged cost by ${usd(diff)}`);
   fill($('bill-note'), 'Rates are Anthropic API list prices per million tokens. Input is uncached input; cache writes bill at 1.25× the input rate (5-minute) or 2× (1-hour); cache reads at the model’s read rate; output includes thinking tokens. Fast-mode calls bill at 2×, Claude Haiku 5.5 prompts over 100K tokens at 5×, web search at $10 per 1,000. Each reply is counted once.',
-    A.bg ? ` Background spend (${usd(A.bg)}) is not split here: those calls never appear in the logs, so their token types are unknown.` : '');
+    A.bg ? ` Background cost (${usd(A.bg)}) is not split here: those calls never appear in the logs, so their token types are unknown.` : '');
 }
 
 // ---------------------------------------------------------------- performance: how fast and how cleanly Claude worked
@@ -806,38 +1002,38 @@ function perfCompute(A) {
   const U = tables.turn.cols;
   for (let i = 0; i < tables.turn.n; i++) {
     const t = U.t[i];
-    if (t < pFrom || t >= to || !okP(U.p[i]) || !(U.dur[i] > 0)) continue;
+    if (t < pFrom || t >= to || !okP(U.p[i], U.s[i]) || !(U.dur[i] > 0)) continue;
     each(t, (S, k) => { S.turns[k].push(U.dur[i]); S.work[k] += U.dur[i]; });
   }
   const R = tables.req.cols;
   for (let i = 0; i < tables.req.n; i++) {
     const t = R.t[i];
-    if (t < pFrom || t >= to || !okP(R.p[i]) || !okA(R.a[i]) || !okM(R.m[i]) || (!ui.advisor && R.adv[i])) continue;
+    if (t < pFrom || t >= to || !okP(R.p[i], R.s[i]) || !okA(R.a[i]) || !okM(R.m[i]) || (!ui.advisor && R.adv[i])) continue;
     const main = !R.adv[i]; // advisor rows carry no thinking time; keep them out of the per-call average
     each(t, (S, k) => { S.out[k] += R.out[i]; if (main) { S.tdm[k] += R.tdm[i]; S.calls[k]++; } });
   }
   const T = tables.tool.cols;
   for (let i = 0; i < tables.tool.n; i++) {
     const t = T.t[i];
-    if (t < pFrom || t >= to || !okP(T.p[i]) || !okA(T.a[i]) || !okToolModel(T, i, R)) continue;
+    if (t < pFrom || t >= to || !okP(T.p[i], T.s[i]) || !okA(T.a[i]) || !okToolModel(T, i, R)) continue;
     const bad = T.err[i] && !T.deny[i] ? 1 : 0;
     const no = rejectedByYou(T, i) ? 1 : 0;
     each(t, (S, k) => { S.toolN[k]++; S.toolBad[k] += bad; S.rej[k] += no; });
   }
   for (const r of replySamples()) {
-    if (r.t < pFrom || r.t >= to || !okP(r.p)) continue;
+    if (r.t < pFrom || r.t >= to || !okP(r.p, r.s)) continue;
     each(r.t, (S, k) => { S.replies[k].push(r.gap); });
   }
   const Pm = tables.prompt.cols;
   for (let i = 0; i < tables.prompt.n; i++) {
     const t = Pm.t[i];
-    if (t < pFrom || t >= to || !okP(Pm.p[i])) continue;
+    if (t < pFrom || t >= to || !okP(Pm.p[i], Pm.s[i])) continue;
     each(t, (S, k) => { S.plen[k].push(Pm.len[i] || 0); });
   }
   const E = tables.evt.cols, kIntr = dicts.kind.indexOf('interrupt');
   for (let i = 0; i < tables.evt.n; i++) {
     const t = E.t[i];
-    if (E.k[i] !== kIntr || t < pFrom || t >= to || !okP(E.p[i])) continue;
+    if (E.k[i] !== kIntr || t < pFrom || t >= to || !okP(E.p[i], E.s[i])) continue;
     each(t, (S, k) => { S.intr[k]++; });
   }
   // by hour of day across all weekdays, for the "quickest / slowest hour" lines
@@ -931,25 +1127,25 @@ function dayView(A) {
   const U = tables.turn.cols;
   for (let i = 0; i < tables.turn.n; i++) {
     const end = U.t[i], start = end - (U.dur[i] || 0);
-    if (end < A.from || start >= A.to || !okP(U.p[i])) continue;
+    if (end < A.from || start >= A.to || !okP(U.p[i], U.s[i])) continue;
     place(start, end, (day, a, b) => { day.work.push([a, b, U.dur[i]]); day.workMs += b - a; span(day, a, b); });
     const day = dayOf(end); if (day && U.dur[i] > day.longest) day.longest = U.dur[i];
   }
   const Pm = tables.prompt.cols;
   for (let i = 0; i < tables.prompt.n; i++) {
     const t = Pm.t[i], day = dayOf(t);
-    if (!day || t < A.from || t >= A.to || !okP(Pm.p[i])) continue;
+    if (!day || t < A.from || t >= A.to || !okP(Pm.p[i], Pm.s[i])) continue;
     day.prompts.push(t); span(day, t, t);
   }
   for (const r of replySamples()) {
-    if (r.t < A.from || r.t >= A.to || !okP(r.p)) continue;
+    if (r.t < A.from || r.t >= A.to || !okP(r.p, r.s)) continue;
     const day = dayOf(r.t); if (day) day.replies.push(r.gap);
     place(r.end, r.t, (d2, a, b) => d2.waits.push([a, b, r.gap]));
   }
   // stops: times you interrupted Claude or rejected one of its tool calls
   const E = tables.evt.cols, kIntr = dicts.kind.indexOf('interrupt'), T = tables.tool.cols;
-  for (let i = 0; i < tables.evt.n; i++) if (E.k[i] === kIntr && okP(E.p[i])) { const day = dayOf(E.t[i]); if (day && E.t[i] >= A.from && E.t[i] < A.to) day.stops = (day.stops || 0) + 1; }
-  for (let i = 0; i < tables.tool.n; i++) if (okP(T.p[i]) && rejectedByYou(T, i)) { const day = dayOf(T.t[i]); if (day && T.t[i] >= A.from && T.t[i] < A.to) day.stops = (day.stops || 0) + 1; }
+  for (let i = 0; i < tables.evt.n; i++) if (E.k[i] === kIntr && okP(E.p[i], E.s[i])) { const day = dayOf(E.t[i]); if (day && E.t[i] >= A.from && E.t[i] < A.to) day.stops = (day.stops || 0) + 1; }
+  for (let i = 0; i < tables.tool.n; i++) if (okP(T.p[i], T.s[i]) && rejectedByYou(T, i)) { const day = dayOf(T.t[i]); if (day && T.t[i] >= A.from && T.t[i] < A.to) day.stops = (day.stops || 0) + 1; }
   for (const day of days.values()) day.wallMs = unionMs(day.work);
   return [...days.values()].reverse(); // newest first
 }
@@ -1023,7 +1219,7 @@ function renderDays(A) {
       h('div', { class: 'r', text: cost ? usd(cost) : '–' }));
   });
   const head = h('div', { class: 'day head', 'aria-hidden': 'true' }, h('span', { text: 'Day' }), h('span', { text: 'Midnight → midnight · lines at 06, 12, 18' }),
-    h('span', { class: 'r', text: 'First – last' }), h('span', { class: 'r', text: 'Claude' }), h('span', { class: 'r', text: 'Your reply' }), h('span', { class: 'r', text: 'Prompts' }), h('span', { class: 'r', text: 'Stops' }), h('span', { class: 'r', text: 'Spend' }));
+    h('span', { class: 'r', text: 'First – last' }), h('span', { class: 'r', text: 'Claude' }), h('span', { class: 'r', text: 'Your reply' }), h('span', { class: 'r', text: 'Prompts' }), h('span', { class: 'r', text: 'Stops' }), h('span', { class: 'r', text: 'Cost' }));
   fill($('days-list'), head, rows);
   hosts.forEach(([host]) => sizeOf(host, 600, 26)); // measure every strip before drawing any: one layout, not one each
   hosts.forEach(([host, day]) => dayStrip(host, day));
@@ -1042,7 +1238,7 @@ function heatData(A, P) {
   const heat = new Float64Array(168), calls = new Float64Array(168);
   for (let i = 0; i < D.tables.req.n; i++) {
     const t = R.t[i];
-    if (t < from || t >= to || !okP(R.p[i]) || !okM(R.m[i]) || !okA(R.a[i]) || (!ui.advisor && R.adv[i])) continue;
+    if (t < from || t >= to || !okP(R.p[i], R.s[i]) || !okM(R.m[i]) || !okA(R.a[i]) || (!ui.advisor && R.adv[i])) continue;
     const cost = Math.max(0, R.cost[i]) * (useBg ? bgShare(EST, R.s[i], t)?.factor || 1 : 1);
     const d = new Date(t), cell = ((d.getDay() + 6) % 7) * 24 + d.getHours();
     heat[cell] += ui.heat === 'cost' ? cost : ui.heat === 'tokens' ? R.in[i] + R.out[i] + R.cr[i] + R.cw5[i] + R.cw1[i] : 1;
@@ -1051,10 +1247,10 @@ function heatData(A, P) {
   return { heat, calls, P: P2, from, to, own: true };
 }
 
-const HEAT_BASE = { cost: { label: 'Spend', fmt: usd }, tokens: { label: 'Tokens', fmt: num }, calls: { label: 'Calls', fmt: int } };
+const HEAT_BASE = { cost: { label: 'Cost', fmt: usd }, tokens: { label: 'Tokens', fmt: num }, calls: { label: 'Calls', fmt: int } };
 function renderHeat(A, P) {
-  seg('heat-metric', [{ v: 'cost', label: 'Spend' }, { v: 'calls', label: 'Calls' }, { v: 'turn', label: 'Turn time' }, { v: 'speed', label: 'Speed' }, { v: 'fail', label: 'Errors' }, { v: 'reply', label: 'Your replies' }, { v: 'plen', label: 'Prompt length' }], ui.heat, (v) => set({ heat: v }));
-  seg('heat-range', [{ v: 'page', label: 'Page range' }, { v: '7d', label: '7d' }, { v: '30d', label: '30d' }, { v: '90d', label: '90d' }, { v: 'all', label: 'All' }], ui.heatRange || 'page', (v) => set({ heatRange: v }));
+  seg('heat-metric', [{ v: 'cost', label: 'Cost' }, { v: 'calls', label: 'Calls' }, { v: 'turn', label: 'Turn time' }, { v: 'speed', label: 'Speed' }, { v: 'fail', label: 'Errors' }, { v: 'reply', label: 'Your replies' }, { v: 'plen', label: 'Prompt length' }], ui.heat, (v) => set({ heat: v }));
+  seg('heat-range', [{ v: 'page', label: 'Page range' }, { v: '7d', label: '7 days' }, { v: '30d', label: '30 days' }, { v: '90d', label: '90 days' }, { v: 'all', label: 'All' }], ui.heatRange || 'page', (v) => set({ heatRange: v }));
   const HD = heatData(A, P);
   const pm = METRICS.find((x) => x.key === ui.heat), base = HEAT_BASE[ui.heat] || HEAT_BASE.cost;
   const label = pm ? pm.label : base.label, fmt = pm ? pm.fmt : base.fmt;
@@ -1067,25 +1263,36 @@ function renderHeat(A, P) {
     const r = pm ? (max > min ? (v - min) / (max - min) : 1) : Math.sqrt(v / max);
     return Math.min(SEQUENTIAL.length - 1, 1 + Math.floor(r * (SEQUENTIAL.length - 2) + 0.5));
   };
-  const cells = [h('span', { class: 'lab' })];
+  const cells = [h('span', { class: 'lab' })], dataCells = [];
   for (let hr = 0; hr < 24; hr++) cells.push(h('span', { class: 'lab hl', text: hr % 3 === 0 ? String(hr).padStart(2, '0') : '' }));
   days.forEach((dn, dIdx) => {
     cells.push(h('span', { class: 'lab', text: dn }));
     for (let hr = 0; hr < 24; hr++) {
       const c = dIdx * 24 + hr, v = vals[c], step = stepOf(v), thin = pm && !Number.isFinite(v) && pm.n(HD.P.H, c) > 0;
-      cells.push(h('span', {
+      const title = `${dn} · ${String(hr).padStart(2, '0')}:00–${String((hr + 1) % 24).padStart(2, '0')}:00`;
+      const has = Number.isFinite(v) && (pm || v > 0), few = pm && pm.n(HD.P.H, c) > 0;
+      const extra = pm ? { label: 'Samples', value: `${int(pm.n(HD.P.H, c))} ${pm.unit}` } : { label: 'API calls', value: int(HD.calls[c]) };
+      // an hour with no value reads "No activity" (or, when it had calls, what it lacks), never a bare dash
+      const rows = has || few ? [{ label, value: has ? fmt(v) : 'too few samples' }, extra]
+        : HD.calls[c] ? [{ label, value: pm ? `no ${pm.unit}` : fmt(0) }, extra] : [{ label: 'No activity', value: '' }];
+      const el = h('span', {
         class: 'c', style: step >= 0 ? { background: SEQUENTIAL[step] } : null, 'data-thin': thin || null, role: 'img',
-        'aria-label': `${dn} ${hr}:00, ${Number.isFinite(v) ? fmt(v) : 'no value'}`,
-        onpointerenter: (e) => showTip(e, `${dn} · ${String(hr).padStart(2, '0')}:00–${String((hr + 1) % 24).padStart(2, '0')}:00`, [
-          { label, value: Number.isFinite(v) && (pm || v > 0) ? fmt(v) : pm && pm.n(HD.P.H, c) ? 'too few samples' : '–' },
-          pm ? { label: 'Samples', value: `${int(pm.n(HD.P.H, c))} ${pm.unit}` } : { label: 'API calls', value: int(HD.calls[c]) }]),
-        onpointermove: moveTip, onpointerleave: hideTip,
-      }));
+        'aria-label': `${dn} ${hr}:00, ${rows[0].value || rows[0].label}`,
+        onpointerenter: (e) => showTip(e, title, rows), onpointermove: moveTip, onpointerleave: hideTip,
+      });
+      cells.push(el); dataCells.push({ el, title, rows });
     }
   });
   fill($('heatmap'), cells);
   let best = -1, low = -1;
   vals.forEach((v, i) => { if (Number.isFinite(v) && v > 0) { if (best < 0 || v > vals[best]) best = i; if (low < 0 || v < vals[low]) low = i; } });
+  // first focus lands on the busiest hour (same pick as the note), not Sunday 23:00, often an empty future hour
+  keyNav($('heatmap'), dataCells.length, (i) => {
+    for (const d of dataCells) d.el.classList.remove('kf');
+    if (i < 0) return null;
+    const d = dataCells[i], r = d.el.getBoundingClientRect(); d.el.classList.add('kf');
+    return { x: r.left + r.width / 2, y: r.top, title: d.title, rows: d.rows };
+  }, 24, best < 0 ? undefined : best);
   const at = (i) => `${days[Math.floor(i / 24)]} ${String(i % 24).padStart(2, '0')}:00 (${fmt(vals[i])})`;
   const text = (HD.own ? `${rangeText(HD.from, HD.to)}. ` : '') + (best < 0 ? 'No activity in this range.' : pm ? `${pm.hi}: ${at(best)}. ${pm.lo}: ${at(low)}. Striped cells had too few samples.` : (() => {
     const byDay = days.map((_, d) => vals.slice(d * 24, d * 24 + 24).reduce((x, y) => x + y, 0));
@@ -1098,9 +1305,9 @@ function renderHeat(A, P) {
 function renderProjects(A) {
   const d = D.dicts, total = A.cost || 1;
   const items = [...A.projects.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([p, x]) => {
-    const l = projLabel(d.project[p]);
-    return { key: d.project[p], label: l.name, small: l.parent, value: usd(x.cost), sub: pct(x.cost / total), share: x.cost / total, title: d.project[p], pressed: ui.projects.includes(d.project[p]),
-      meta: [h('span', { text: `${int(x.sess.size)} session${x.sess.size === 1 ? '' : 's'}` }), h('span', { text: `${int(x.calls)} calls` }), h('span', { text: `${num(x.tok)} tokens` })] };
+    const l = projLabel(d.project[p]), r = A.topP.get(p); // the colour this project has in the Usage chart's project split; the rest are Other there
+    return { key: d.project[p], label: l.name, small: l.parent, color: r !== undefined ? CATEGORICAL[r] : OTHER, value: usd(x.cost), sub: pct(x.cost / total), share: x.cost / total, title: maskPath(d.project[p]), pressed: ui.projects.includes(d.project[p]),
+      meta: [h('span', { text: `${int(x.sess.size)} session${x.sess.size === 1 ? '' : 's'}` }), h('span', { text: nCalls(x.calls) }), h('span', { text: `${num(x.tok)} tokens` })] };
   });
   barList($('project-bars'), 'projects', items, { onClick: (it) => set({ projects: toggleIn(ui.projects, it.key) }) });
 }
@@ -1126,9 +1333,11 @@ function renderAttr(A) {
   for (const [k, x] of map) {
     if (!k) { none = x.cost; continue; }
     const r = ui.attr === 'agent' ? A.topA.get(k) : undefined;
-    items.push({ key: names[k], label: ui.attr === 'agent' ? agentName(names[k]) : names[k], color: r !== undefined ? CATEGORICAL[r] : null, value: usd(x.cost), sub: pct(x.cost / total), share: x.cost / total, meta: [h('span', { text: `${int(x.calls)} calls` })] });
+    items.push({ key: names[k], label: ui.attr === 'agent' ? agentName(names[k]) : names[k], color: r !== undefined ? CATEGORICAL[r] : null, value: usd(x.cost), sub: pct(x.cost / total), share: x.cost / total, meta: [h('span', { text: nCalls(x.calls) })] });
   }
   items.sort((a, b) => b.share - a.share);
+  // Presenting mode leaves branch names out (they can name clients or tickets); ranked placeholders keep the split readable
+  if (ui.attr === 'branch' && ui.hideAccount) items.forEach((it, i) => { it.label = `Branch ${i + 1} (name hidden)`; });
   if (ui.attr !== 'agent' && none) items.push({ key: '', label: ui.attr === 'branch' ? 'No git branch' : `Not from a ${ui.attr === 'mcp' ? 'MCP server' : ui.attr}`, value: usd(none), sub: pct(none / total), share: none / total, fillColor: 'var(--bar-dim)' });
   barList($('attr-bars'), 'attr-' + ui.attr, items, { limit: 8 });
 }
@@ -1159,13 +1368,14 @@ function renderFacts(A) {
     fact('How replies ended', refusals ? `${int(refusals)} refusals` : 'No refusals', null, list(stops.slice(0, 4))),
     fact('Context compactions', int(compacts), compacts ? `avg ${num(A.compactPre / compacts)} → ${num(A.compactPost / compacts)} tokens` : 'context never filled up'),
     fact('Code changed', A.cc.n ? `+${int(A.cc.add)} / −${int(A.cc.del)}` : '–', A.cc.n ? `lines, from ${int(A.cc.n)} session counters` : 'no session counters in range'),
-    fact('Limits & errors', int(limits), 'usage-limit hits', list([[`Web searches · fetches`, `${int(A.ws)} · ${int(A.wf)}`], ...apiErr.map(([k, v]) => [KIND[k] || k.replace('api_error:', 'API error: ').replace(/_/g, ' '), int(v.n), 'meh'])])),
+    fact('Limits & errors', int(limits), 'usage-limit hits', apiErr.length ? list(apiErr.map(([k, v]) => [KIND[k] || k.replace('api_error:', 'API error: ').replace(/_/g, ' '), int(v.n), 'meh'])) : null),
+    fact('Web searches', int(A.ws), `${int(A.wf)} page${A.wf === 1 ? '' : 's'} fetched`),
+    // 12 facts in all: the grid is 4, 2 or 1 columns wide, and a short last row would show the grey ground
     ...paceFacts(A, fact, list));
 }
 
 function paceFacts(A, fact, list) {
-  const days = [...A.days.entries()], peak = days.sort((a, b) => b[1].cost - a[1].cost)[0];
-  const now = new Date(), elapsed = (now - A.monthStart) / 864e5, inMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const days = [...A.days.entries()], peak = days.sort((a, b) => b[1].cost - a[1].cost)[0], cw = costWord(A).short;
   const sess = [...A.sessions.entries()].map(([sIdx, x]) => ({ x, m: D.sessions.get(sIdx) || {} }));
   const spans = sess.map((r) => (r.m.t1 || 0) - (r.m.t0 || 0)).filter((v) => v > 0);
   const costs = sess.map((r) => r.x.cost).sort((a, b) => a - b);
@@ -1174,11 +1384,10 @@ function paceFacts(A, fact, list) {
   const src = [...A.promptSrc.entries()].sort((a, b) => b[1].n - a[1].n);
   const SRC = { typed: 'Typed', queued: 'Queued while busy', suggestion_accepted: 'Accepted a suggestion', system: 'System' };
   return [
-    fact('Daily pace', A.days.size ? usd(A.cost / A.days.size) : '–', A.days.size ? `per active day · ${int(A.days.size)} active day${A.days.size === 1 ? '' : 's'}` : 'no activity in range',
+    fact('Daily pace', A.days.size ? usd(A.cost / A.days.size) : '–', A.days.size ? `${cw} per active day · ${int(A.days.size)} active day${A.days.size === 1 ? '' : 's'}` : 'no activity in range',
       peak ? list([[`Busiest: ${fWeekday.format(peak[0])}`, usd(peak[1].cost)]]) : null),
-    fact('This month', usd(A.mtd), elapsed > 0.25 ? `since ${fDay.format(A.monthStart)} · on pace for ${usd((A.mtd / elapsed) * inMonth)}` : `since ${fDay.format(A.monthStart)}`),
-    fact('Sessions', spans.length ? dur(spans.reduce((x, y) => x + y, 0) / spans.length) : '–', costs.length ? `average length · median ${usd(median)} each` : 'no sessions in range',
-      longest ? list([[`Longest: ${longest.m.title || (longest.m.id || '').slice(0, 8)}`, dur((longest.m.t1 || 0) - (longest.m.t0 || 0))]]) : null),
+    fact('Sessions', spans.length ? dur(spans.reduce((x, y) => x + y, 0) / spans.length) : '–', costs.length ? `average length · ${cw} median ${usd(median)}` : 'no sessions in range',
+      longest ? list([[`Longest: ${!ui.hideAccount && longest.m.title || `Session ${(longest.m.id || '').slice(0, 8)}`}`, dur((longest.m.t1 || 0) - (longest.m.t0 || 0))]]) : null),
     fact('Prompts & hooks', A.hookRuns ? `${int(A.hookRuns)} hook runs` : 'No hook runs', A.hookRuns ? `${dur(A.hookMs)} spent in stop hooks · ${int(A.hookMs / A.hookRuns)} ms average` : 'none logged in this range',
       list(src.map(([k, v]) => [SRC[k] || k, `${int(v.n)} prompts`]))),
   ];
@@ -1200,8 +1409,10 @@ function renderAccuracy(A) {
     item('Parsing', `${int(m.badLines)} bad lines`, `${num(m.lines)} lines read from ${int(m.files)} files (${(m.bytes / 1e6).toFixed(0)} MB), read-only, updated live.`, m.badLines ? 'warn' : 'good'));
 }
 
+// Presenting mode hides session titles (they can name private work) and the short id stands in; rows keep the real title for search and sort
+function tSessTitle(r) { return ui.hideAccount ? `Session ${(r.meta.id || '').slice(0, 8)}` : r.title || 'Untitled session'; }
 function renderSessions(A) {
-  const d = D.dicts, q = ui.sessQ.trim().toLowerCase();
+  const d = D.dicts, q = ui.sessQ.trim().toLowerCase(), hide = ui.hideAccount, cw = costWord(A).short;
   let rows = [...A.sessions.entries()].map(([sIdx, x]) => {
     const m = D.sessions.get(sIdx) || {};
     // every folder its calls ran in: a session moved with /cd has more than one
@@ -1211,23 +1422,28 @@ function renderSessions(A) {
   if (q) rows = rows.filter((r) => r.title.toLowerCase().includes(q) || r.proj.toLowerCase().includes(q) || (r.meta.id || '').includes(q));
   const k = ui.sort, dir = ui.dir;
   rows.sort((a, b) => ((a[k] ?? 0) > (b[k] ?? 0) ? 1 : (a[k] ?? 0) < (b[k] ?? 0) ? -1 : 0) * dir);
-  const cols = [['t0', 'Started'], ['title', 'Session'], ['models', 'Models', true], ['span', 'Length', false, true], ['active', 'Working', false, true], ['prompts', 'Prompts', false, true], ['calls', 'Calls', false, true], ['tools', 'Tools', false, true], ['tok', 'Tokens', false, true], ['cost', 'Cost', false, true], ['cc', 'CC counter', false, true]];
+  const cols = [['t0', 'Started'], ['title', 'Session'], ['models', 'Models', true], ['span', 'Length', false, true], ['active', 'Working', false, true], ['prompts', 'Prompts', false, true], ['calls', 'Calls', false, true], ['tools', 'Tools', false, true], ['tok', 'Tokens', false, true], ['cost', cw, false, true], ['cc', 'CC’s counter', false, true]];
   const shown = rows.slice(0, ui.sessLimit);
+  sessRows = rows; sessOrder = rows.map((r) => r.sIdx); // for the CSV and the drawer's next / previous
   fill($('sess-table'),
     h('thead', null, h('tr', null, cols.map(([key, label, nosort, right]) => h('th', { class: right ? 'r' : null, 'aria-sort': key === k ? (dir > 0 ? 'ascending' : 'descending') : null, scope: 'col' },
       nosort ? label : h('button', { type: 'button', onclick: () => set({ sort: key, dir: key === k ? -dir : -1 }) }, label, key === k ? (dir > 0 ? ' ↑' : ' ↓') : ''))))),
     h('tbody', null, shown.map((r) => h('tr', {
-      tabindex: '0', 'data-s': String(r.sIdx), 'data-fk': 's:' + r.sIdx, onclick: () => openDrawer(r.sIdx), onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDrawer(r.sIdx); } },
+      tabindex: '0', 'aria-describedby': 'sess-hint', 'data-s': String(r.sIdx), 'data-fk': 's:' + r.sIdx, onclick: () => openDrawer(r.sIdx), onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDrawer(r.sIdx); } },
     },
     h('td', { class: 'dim', text: fDateTime.format(r.t0) }),
-    h('td', null, h('div', { class: 'title', text: r.title || (r.meta.id || '').slice(0, 8) }), h('div', { class: 'sub', text: r.projNames + (r.meta.branch ? ' · ' + r.meta.branch : '') })),
-    h('td', null, h('span', { class: 'dots' }, [...r.models].map((m) => h('i', { class: 'sw', title: d.model[m], style: { background: modelColor(d.model[m]) } })))),
+    // a session Claude Code never titled says so; its short id moves to the second line (search still finds it)
+    h('td', null, h('div', { class: 'title', text: tSessTitle(r) }), h('div', { class: 'sub', text: r.projNames + (hide ? '' : (r.meta.branch ? ' · ' + r.meta.branch : '') + (r.title ? '' : ' · ' + (r.meta.id || '').slice(0, 8))) })),
+    // model names, not colour alone; two shown, the rest counted
+    h('td', null, h('span', { class: 'dots', title: [...r.models].map((m) => modelName(d.model[m])).join(', ') }, [...r.models].slice(0, 2).map((m) => h('span', null, h('i', { class: 'sw', style: { background: modelColor(d.model[m]) } }), modelName(d.model[m]))), r.models.size > 2 ? h('span', { text: `+${r.models.size - 2}` }) : null)),
     h('td', { class: 'r', text: dur(r.span) }), h('td', { class: 'r', text: dur(r.active) }), h('td', { class: 'r', text: int(r.prompts) }),
     h('td', { class: 'r', text: int(r.calls) }), h('td', { class: 'r', text: int(r.tools) }), h('td', { class: 'r', text: num(r.tok) }),
     h('td', { class: 'r', text: usd(r.cost) }), h('td', { class: 'r dim', text: r.cc >= 0 ? usd(r.cc) : '–' })))));
   if (!rows.length) $('sess-table').append(h('tbody', null, h('tr', null, h('td', { colspan: String(cols.length), class: 'dim', text: q ? 'No session matches that filter.' : 'No sessions in this range.' }))));
-  fill($('sess-foot'), h('span', { text: `${int(shown.length)} of ${int(rows.length)} sessions · Cost is activity in this range (logged calls plus their background share once Claude Code has saved a counter after them); CC counter is Claude Code’s own saved counter for the whole session.` }),
-    rows.length > shown.length ? h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => set({ sessLimit: ui.sessLimit + 25 }), text: 'Show 25 more' }) : null);
+  const more = rows.length - shown.length, btn = (text, sessLimit) => h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => set({ sessLimit }), text });
+  fill($('sess-foot'), h('span', { text: `${int(shown.length)} of ${int(rows.length)} sessions · ${cw}: logged calls in this range${filters().useBg ? ' plus each session’s share of background calls' : ', background calls left out'} · CC’s counter: Claude Code’s counter, its own total for the whole session, for comparison.` }),
+    // the row limit is saved, so a table opened in full can go back to 25
+    h('span', { class: 'sess-more' }, more > 25 ? btn('Show 25 more', ui.sessLimit + 25) : null, more ? btn(`Show all ${int(rows.length)}`, rows.length) : shown.length > 25 ? btn('Show fewer', 25) : null));
 }
 
 // ---------------------------------------------------------------- session drawer: a DrawerState (public/machines.js)
@@ -1240,7 +1456,8 @@ function drawerEvent(ev) {
   dr = state;
   const dEl = $('drawer'), scrim = $('scrim');
   for (const fx of effects) {
-    if (fx === 'show') { dEl.hidden = false; scrim.hidden = false; renderDrawer(); $('drawer-close').focus({ preventScroll: true }); }
+    // focus moves into the drawer when it opens; stepping to the next session keeps it where it is (on next / previous)
+    if (fx === 'show') { dEl.hidden = false; scrim.hidden = false; renderDrawer(); if (!dEl.contains(document.activeElement)) $('drawer-close').focus({ preventScroll: true }); }
     else if (fx === 'slideIn') { dEl.setAttribute('data-open', ''); scrim.setAttribute('data-open', ''); }
     else if (fx === 'slideOut') { dEl.removeAttribute('data-open'); scrim.removeAttribute('data-open'); }
     else if (fx === 'hide') { dEl.hidden = true; scrim.hidden = true; }
@@ -1263,9 +1480,22 @@ document.addEventListener('keydown', (e) => {
   if (e.shiftKey && (document.activeElement === firstEl || !$('drawer').contains(document.activeElement))) { e.preventDefault(); lastEl.focus(); }
   else if (!e.shiftKey && (document.activeElement === lastEl || !$('drawer').contains(document.activeElement))) { e.preventDefault(); firstEl.focus(); }
 });
+let sessRows = [], sessOrder = [], billRows = []; // the Sessions table's rows in its order, the billing rows: for CSV and next / previous
+function stepDrawer(d) {
+  const i = sessOrder.indexOf(drawerIdx()), next = sessOrder[i + d];
+  if (i < 0 || next === undefined) return;
+  lastFocus = null; // closing then returns to the row of the session shown last
+  drawerEvent({ type: 'open', sid: D.dicts.session[next] });
+  // the content changes under the focused next / previous button: say which session shows now (first open moves focus instead)
+  $('drawer-live').textContent = `${$('drawer-title').textContent}, ${$('drawer-pos').textContent}`;
+}
 function renderDrawer() {
   const sIdx = drawerIdx();
   if (sIdx < 1) return;
+  const at = sessOrder.indexOf(sIdx);
+  $('drawer-prev').disabled = at <= 0; $('drawer-next').disabled = at < 0 || at >= sessOrder.length - 1;
+  $('drawer-pos').textContent = at < 0 ? '' : `${int(at + 1)} of ${int(sessOrder.length)}`;
+  if (dr.kind === 'opening') $('drawer-live').textContent = ''; // an open or a step empties it (a step then fills it); live updates leave it alone
   const d = D.dicts, m = D.sessions.get(sIdx) || {}, R = D.tables.req.cols, T = D.tables.tool.cols;
   const calls = []; const byModel = new Map(), byAgent = new Map(), byTool = new Map(), toolsOf = new Map();
   let cost = 0, tok = 0, active = 0, turns = 0, longest = 0, prompts = 0;
@@ -1290,17 +1520,24 @@ function renderDrawer() {
   calls.sort((a, b) => R.t[a] - R.t[b]);
   const toolTotal = [...byTool.values()].reduce((x, y) => x + y.calls, 0), toolBad = [...byTool.values()].reduce((x, y) => x + y.err + y.deny, 0);
 
-  $('drawer-title').textContent = m.title || 'Untitled session';
-  $('drawer-sub').textContent = `${d.project[m.p] || ''}${m.branch ? ' · ' + m.branch : ''}${m.version ? ' · v' + m.version : ''}`;
-  const stat = (k, v) => h('div', null, h('span', { class: 'k', text: k }), h('span', { class: 'v', text: v }));
+  // Presenting mode hides session titles and branch names; the project folder stays
+  $('drawer-title').textContent = ui.hideAccount ? `Session ${(m.id || '').slice(0, 8)}` : m.title || 'Untitled session';
+  $('drawer-sub').textContent = `${maskPath(d.project[m.p]) || ''}${m.branch && !ui.hideAccount ? ' · ' + m.branch : ''}${m.version ? ' · v' + m.version : ''}`;
+  const stat = (k, v, sub) => h('div', null, h('span', { class: 'k', text: k }), h('span', { class: 'v', text: v }), sub ? h('span', { class: 's', text: sub }) : null);
+  const ss = lastA?.sessions.get(sIdx); // the Sessions table's figure: activity in the range, background share included
+  // cut: the range or filters hold only part of the session, so the first figure can't be held against the counter
+  const cut = ss && Math.abs(ss.cost - ss.bg - cost) > Math.max(0.01, cost * 0.01), whole = ss && !cut;
   const host = h('div', { class: 'chart', style: { height: '170px' } });
   fill($('drawer-body'),
     h('div', { class: 'dstats' },
-      stat('Logged calls', usd(cost)), stat('CC counter (saved)', m.cs ? usd(m.cs.cost) : '–'), stat('Length', dur((m.t1 || 0) - (m.t0 || 0))),
+      stat(lastA ? costWord(lastA).short : 'Cost', ss ? usd(ss.cost) : '–', ss ? `Logged calls ${usd(ss.cost - ss.bg)} · background share ${usd(ss.bg)}` : null),
+      stat('Claude Code’s counter', m.cs ? usd(m.cs.cost) : '–', m.cs ? 'its own total for the whole session' : 'not saved yet'), stat('Length', dur((m.t1 || 0) - (m.t0 || 0))),
       stat('Claude working', dur(active)), stat('Prompts', int(prompts)), stat('API calls', int(calls.length)),
       stat('Tool calls', `${int(toolTotal)}${toolBad ? ' · ' + int(toolBad) + ' failed' : ''}`), stat('Tokens', num(tok)), stat('Lines', m.cs ? `+${int(m.cs.add)} / −${int(m.cs.del)}` : '–')),
-    m.cs && m.cs.cost > cost * 1.02 ? h('p', { class: 'foot-note', text: `Claude Code’s counter is ${usd(m.cs.cost - cost)} higher: it also counts calls that were never written to the transcript.` }) : null,
-    m.cs && m.cs.cost < cost * 0.98 ? h('p', { class: 'foot-note', text: 'Claude Code only saves its counter now and then, so for a session that is still running (or ended abruptly) it trails the estimate.' }) : null,
+    whole && m.cs && m.cs.cost > ss.cost * 1.02 ? h('p', { class: 'foot-note', text: `Claude Code’s counter is ${usd(m.cs.cost - ss.cost)} higher: it covers the whole session, including calls that were never written to the transcript.` }) : null,
+    whole && m.cs && m.cs.cost < ss.cost * 0.98 ? h('p', { class: 'foot-note', text: 'Claude Code only saves its counter now and then, so for a session that is still running (or ended abruptly) it trails the total above.' }) : null,
+    // the first figure follows the range and filters (it is the table's); everything else here is the whole session
+    cut ? h('p', { class: 'foot-note', text: `The range and filters hold ${usd(ss.cost - ss.bg)} of this session’s ${usd(cost)} in logged calls. Everything else here covers the whole session.` }) : null,
     h('section', { class: 'dsec' }, h('h3', { class: 'eyebrow', text: 'Each API call over time' }), host,
       h('p', { class: 'foot-note', text: `${calls.length ? fDateTime.format(R.t[calls[0]]) : ''} → ${calls.length ? fDateTime.format(R.t[calls.at(-1)]) : ''} · ${turns} turn${turns === 1 ? '' : 's'}, longest ${dur(longest)}` })),
     h('section', { class: 'dsec' }, h('h3', { class: 'eyebrow', text: 'Models' }), h('div', { class: 'bars', id: 'd-models' })),
@@ -1308,8 +1545,8 @@ function renderDrawer() {
     h('section', { class: 'dsec' }, h('h3', { class: 'eyebrow', text: 'Tools' }), h('div', { class: 'bars', id: 'd-tools' })),
     h('p', { class: 'foot-note mono', text: `Session ${m.id || ''}` }));
   const share = (x) => x.cost / (cost || 1);
-  barList($('d-models'), 'd-models', [...byModel].sort((a, b) => b[1].cost - a[1].cost).map(([k, x]) => ({ label: modelName(d.model[k]), color: modelColor(d.model[k]), value: usd(x.cost), sub: `${int(x.calls)} calls`, share: share(x) })));
-  barList($('d-agents'), 'd-agents', [...byAgent].sort((a, b) => b[1].cost - a[1].cost).map(([k, x]) => ({ label: agentName(d.agent[k]), value: usd(x.cost), sub: `${int(x.calls)} calls`, share: share(x) })));
+  barList($('d-models'), 'd-models', [...byModel].sort((a, b) => b[1].cost - a[1].cost).map(([k, x]) => ({ label: modelName(d.model[k]), color: modelColor(d.model[k]), value: usd(x.cost), sub: nCalls(x.calls), share: share(x) })));
+  barList($('d-agents'), 'd-agents', [...byAgent].sort((a, b) => b[1].cost - a[1].cost).map(([k, x]) => ({ label: agentName(d.agent[k]), value: usd(x.cost), sub: nCalls(x.calls), share: share(x) })));
   const tmax = Math.max(1, ...[...byTool.values()].map((x) => x.calls));
   barList($('d-tools'), 'd-tools', [...byTool].sort((a, b) => b[1].calls - a[1].calls).map(([k, x]) => { const l = toolLabel(d.tool[k]); return { label: l.name, small: l.prefix ? 'MCP · ' + l.prefix : '', value: int(x.calls), sub: x.err + x.deny ? `${x.err + x.deny} failed` : '', share: x.calls / tmax }; }), { limit: 10 });
 
@@ -1358,20 +1595,39 @@ function histEvent(ev, res) {
 async function fetchHistory(seq) {
   // its own range picker; 'all' reaches back past the transcripts, since history.jsonl is kept separately
   const hr = ui.histRange || 'page', [from, to] = hr === 'all' ? [0, Date.now()] : rangeBounds(hr);
-  const params = new URLSearchParams({ q: $('hist-q').value, from: String(from), to: String(to), limit: '60' });
+  const params = new URLSearchParams({ q: $('hist-q').value, from: String(from), to: String(to), limit: String(histLimit) });
   if (ui.projects.length === 1) params.set('project', ui.projects[0]);
+  if (ui.accounts.length === 1) params.set('account', ui.accounts[0]); // the server maps each prompt's session to its account
   let res;
   try { const r = await fetch('/api/history?' + params); if (!r.ok) throw new Error(String(r.status)); res = await r.json(); } catch { histEvent({ type: 'failed', seq }); return; }
   histEvent({ type: 'loaded', seq }, res); // the machine drops it if a newer query started meanwhile
 }
+let histLimit = 60, lastHist = null, histReveal = false; // shown count; last answer (to redraw without a fetch); prompts shown while presenting
 function renderHistory(res) {
+    lastHist = res;
     const q = $('hist-q').value, words = q.toLowerCase().split(/\s+/).filter(Boolean);
-    $('hist-meta').textContent = res.total ? `${int(res.total)} prompt${res.total === 1 ? '' : 's'}${q ? ' match' : ' in this range'}${res.total > res.items.length ? ` · newest ${res.items.length} shown` : ''}${ui.projects.length === 1 ? ' · current project only' : ''}` : (q ? 'No prompt matches.' : 'No prompts in this range.');
+    // history.jsonl holds everything typed, /commands and ! lines too, so it can count more than the Prompts tile
+    $('hist-meta').textContent = res.total ? `${int(res.total)} prompt${res.total === 1 ? '' : 's'}${q ? ' match' : ' in this range'}, counting /commands and ! lines${res.total > res.items.length ? ` · newest ${res.items.length} shown` : ''}${ui.projects.length === 1 ? ' · current project only' : ''}` : (q ? 'No prompt matches.' : 'No prompts in this range.');
+    // presenting: prompt text stays off screen until asked for, one click away
+    if (ui.hideAccount && !histReveal && res.total) {
+      fill($('hist-list'), h('li', null, h('span', { class: 'hint', text: 'Prompts are hidden while personal details are hidden.' }),
+        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { histReveal = true; renderHistory(lastHist); }, text: 'Show prompts' })));
+      fill($('hist-more'));
+      return;
+    }
+    // every prompt is reachable: 60 more at a time, or all at once
+    const more = res.total - res.items.length;
+    fill($('hist-more'), more > 0 ? [
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { histLimit += 60; loadHistory(); }, text: `Show ${int(Math.min(60, more))} more` }),
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { histLimit = res.total; loadHistory(); }, text: `Show all ${int(res.total)}` })] : null);
     // a live refresh keeps what you expanded and where you scrolled
     const list = $('hist-list'), top = list.scrollTop;
+    // each prompt is a button, so the keyboard can expand it too (Enter or Space)
+    const toggle = (el, t) => { const open = el.parentElement.toggleAttribute('data-open'); el.setAttribute('aria-expanded', String(open)); open ? histOpen.add(t) : histOpen.delete(t); };
     fill(list, res.items.map((it) => h('li', { 'data-open': histOpen.has(it.t) || null },
-      h('time', { datetime: new Date(it.t).toISOString(), text: fDateTime.format(it.t) }, h('span', { class: 'proj', text: projLabel(it.project).name, title: it.project })),
-      h('p', { class: 'text', title: 'Click to expand', onclick: (e) => { const li = e.currentTarget.parentElement; li.toggleAttribute('data-open'); li.hasAttribute('data-open') ? histOpen.add(it.t) : histOpen.delete(it.t); } }, highlight(it.text, words)))));
+      h('time', { datetime: new Date(it.t).toISOString(), text: fDateTime.format(it.t) }, h('span', { class: 'proj', text: projLabel(it.project).name, title: maskPath(it.project) })),
+      h('p', { class: 'text', role: 'button', tabindex: '0', 'aria-expanded': String(histOpen.has(it.t)), title: 'Click to expand',
+        onclick: (e) => toggle(e.currentTarget, it.t), onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e.currentTarget, it.t); } } }, highlight(it.text, words)))));
     list.scrollTop = top;
 }
 const histOpen = new Set(); // expanded prompts, by timestamp
@@ -1395,13 +1651,37 @@ function highlight(text, words) {
 
 // ---------------------------------------------------------------- top bar: range, custom dates, filters, live
 function renderTop() {
-  seg('hist-range', [{ v: 'page', label: 'Page range' }, { v: '24h', label: '24h' }, { v: '7d', label: '7d' }, { v: '30d', label: '30d' }, { v: 'all', label: 'All time' }], ui.histRange || 'page', (v) => set({ histRange: v }));
+  // the same words as the page range above: "7 days", "All"
+  seg('hist-range', [{ v: 'page', label: 'Page range' }, { v: '24h', label: '24h' }, { v: '7d', label: '7 days' }, { v: '30d', label: '30 days' }, { v: 'all', label: 'All' }], ui.histRange || 'page', (v) => set({ histRange: v }));
   seg('range', RANGES, ui.range, (v) => set({ range: v }));
   const [f, t] = rangeBounds();
-  $('custom-label').textContent = HOURS[ui.range] ? `Last ${HOURS[ui.range]}h` : ui.range === 'custom' ? (liveEnd() ? `${fDateTime.format(f)} → now` : rangeText(f, t)) : 'Dates';
-  const n = ui.projects.length + ui.models.length + (ui.subagents ? 0 : 1) + (ui.advisor ? 0 : 1) + (ui.background ? 0 : 1);
-  const c = $('filter-count'); c.hidden = !n; c.textContent = String(n);
+  // narrow screens hide the range buttons (they move into this menu), so the button names the range instead; phones
+  // (820px and under, by CSS) show only the short form ("7d", "3h", a start date); the accessible name keeps it whole
+  const rangeName = HOURS[ui.range] ? `Last ${HOURS[ui.range]}h` : ui.range === 'custom' ? (liveEnd() ? `${fDateTime.format(f)} → now` : rangeText(f, t))
+    : RANGES.find((r) => r.v === ui.range)?.label || 'Dates';
+  $('custom-label').textContent = NARROW.matches || HOURS[ui.range] || ui.range === 'custom' ? rangeName : 'Dates';
+  $('custom-short').textContent = ui.range === 'custom' ? fDay.format(f) : rangeName.replace('Last ', '').replace(' days', 'd');
+  $('custom-btn').setAttribute('aria-label', `Dates, ${rangeName}`);
+  const chips = filterChips();
+  const c = $('filter-count'); c.hidden = !chips.length; c.textContent = String(chips.length);
+  $('p-clear')?.toggleAttribute('hidden', !chips.length); // the Filters popover's Clear, in step as you tick (it isn't rebuilt under your focus)
+  // every active filter on view, each one click from gone: a saved filter otherwise hides in a count badge across reloads
+  const box = $('filter-chips'); box.hidden = !chips.length;
+  // a removed chip hands focus to the next chip (else the one before, else Filters) instead of dropping it on the page;
+  // draw() finds that chip again after the rebuild by its data-fk
+  const unchip = (e, patch) => { const b = e.currentTarget, n = b.nextElementSibling?.classList.contains('chip') ? b.nextElementSibling : b.previousElementSibling; (n || $('filter-btn')).focus({ preventScroll: true }); set(patch); };
+  fill(box, chips.map(([label, patch]) => h('button', { class: 'btn btn-ghost btn-sm chip', type: 'button', 'data-fk': 'chip:' + label, 'aria-label': `Remove filter: ${label}`, onclick: (e) => unchip(e, patch) }, label, h('span', { 'aria-hidden': 'true', text: '×' }))),
+    chips.length > 1 ? h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'data-fk': 'chip:clear', onclick: () => { $('filter-btn').focus({ preventScroll: true }); set(NO_FILTERS); }, text: 'Clear all' }) : null);
 }
+const NO_FILTERS = { projects: [], models: [], accounts: [], subagents: true, advisor: true, background: true }; // apiProjects is a setting, not a filter
+const filterChips = () => [
+  ...ui.accounts.map((k) => [`Account: ${accountLabel(k)}`, { accounts: ui.accounts.filter((x) => x !== k) }]),
+  ...ui.projects.map((p) => [`Project: ${projLabel(p).name}`, { projects: ui.projects.filter((x) => x !== p) }]),
+  ...ui.models.map((m) => [`Model: ${modelName(m)}`, { models: ui.models.filter((x) => x !== m) }]),
+  ...(ui.subagents ? [] : [['Subagents hidden', { subagents: true }]]),
+  ...(ui.advisor ? [] : [['Advisor calls hidden', { advisor: true }]]),
+  ...(ui.background ? [] : [['Background calls hidden', { background: true }]]),
+];
 // popovers (Dates, Filters): a PopState (public/machines.js), at most one open
 const POPS = { filter: ['filter-btn', 'filter-pop'], custom: ['custom-btn', 'custom-pop'] };
 let pop = POP_CLOSED;
@@ -1416,59 +1696,131 @@ function popEvent(ev) {
     else if (fx.kind === 'refresh' && fx.id === 'filter') buildFilters(); // the Dates inputs keep what you typed
   }
 }
+let projFind = ''; // the project search survives the popover being rebuilt by a live update
 function buildFilters() {
-  const d = D.dicts, R = D.tables.req.cols;
-  const pc = new Map(), mc = new Map();
-  for (let i = 0; i < D.tables.req.n; i++) { const c = Math.max(0, R.cost[i]); pc.set(R.p[i], (pc.get(R.p[i]) || 0) + c); mc.set(R.m[i], (mc.get(R.m[i]) || 0) + c); }
+  const d = D.dicts, R = D.tables.req.cols, [from, to] = rangeBounds();
+  // amounts are spend in the page range, like every panel; a project or model idle in the range stays listed (at –)
+  // so a filter chosen under another range can still be unticked
+  const pc = new Map(), mc = new Map(), ac = new Map(), used = new Set(); // used: projects with a call in the range
+  for (const s of D.sessions.keys()) ac.set(acctOf(s), 0); // every account in the data, even if idle in the range
+  for (let i = 0; i < D.tables.req.n; i++) {
+    const on = R.t[i] >= from && R.t[i] < to, c = on ? Math.max(0, R.cost[i]) : 0;
+    if (on) used.add(R.p[i]);
+    pc.set(R.p[i], (pc.get(R.p[i]) || 0) + c); mc.set(R.m[i], (mc.get(R.m[i]) || 0) + c);
+    const k = acctOf(R.s[i]); ac.set(k, (ac.get(k) || 0) + c);
+  }
+  const amt = (c) => (c > 0 ? usdShort(c) : '–');
   const check = (label, meta, checked, onChange, color, title) => h('label', { class: 'check', title },
     h('input', { type: 'checkbox', checked: checked || null, onchange: (e) => onChange(e.target.checked) }),
     h('span', { class: 'name' }, color ? h('i', { style: { background: color } }) : null, label), h('span', { class: 'meta', text: meta }));
   const sw = (label, small, checked, onChange) => h('label', { class: 'toggle-row' }, h('span', null, label, h('small', { text: small })), h('input', { type: 'checkbox', class: 'switch', role: 'switch', checked: checked || null, onchange: (e) => onChange(e.target.checked) }));
   // chosen names the data no longer has (cleaned-up transcripts): still filtering (to nothing), so list them to untick
   const { projSel, modelSel } = filters();
-  const gone = (sel, key, label) => (sel?.unavailable || []).map((name) => check(label(name), 'no data', true, () => set({ [key]: toggleIn(ui[key], name) }), null, name));
+  const gone = (sel, key, label) => (sel?.unavailable || []).map((name) => check(label(name), 'no data', true, () => set({ [key]: toggleIn(ui[key], name) }), null, maskPath(name)));
+  // projects idle in the range (most of a long history) fold away; a ticked one stays in view, to be unticked
+  const projs = [...pc].sort((a, b) => b[1] - a[1]).filter(([p]) => p), idle = ([p]) => !used.has(p) && !ui.projects.includes(d.project[p]);
+  const projCheck = ([p, c]) => check(projLabel(d.project[p]).name, amt(c), ui.projects.includes(d.project[p]), () => set({ projects: toggleIn(ui.projects, d.project[p]) }), null, maskPath(d.project[p]));
+  const projChecks = projs.filter((x) => !idle(x)).map(projCheck), idleChecks = projs.filter(idle).map(projCheck);
+  // the fold's own open state is kept only from your clicks, not from a search opening it
+  const idleFold = idleChecks.length ? h('details', { class: 'explain', open: pIdleOpen || null, ontoggle: (e) => { if (!projFind) pIdleOpen = e.target.open; } },
+    h('summary', { text: `${idleChecks.length} idle in this range` }), h('div', { class: 'checks' }, idleChecks)) : null;
+  const findProj = () => {
+    const q = projFind.toLowerCase();
+    for (const el of [...projChecks, ...idleChecks]) el.hidden = !!q && !el.textContent.toLowerCase().includes(q);
+    // a search reaches into the fold: open while it holds a match, hidden while it holds none
+    if (idleFold) { const hit = idleChecks.some((el) => !el.hidden); idleFold.hidden = !!q && !hit; idleFold.open = pIdleOpen || (!!q && hit); }
+  };
+  findProj();
+  // accounts: real ones first (by cost), "No account recorded" last; a picked account the data no longer has stays listed
+  const acctChecks = [...ac].sort((a, b) => (a[0] === 'none') - (b[0] === 'none') || b[1] - a[1]).map(([k, c]) => check(accountLabel(k), amt(c), ui.accounts.includes(k), () => set({ accounts: toggleIn(ui.accounts, k) })));
+  const acctGone = ui.accounts.filter((k) => !ac.has(k)).map((k) => check(accountLabel(k), 'no data', true, () => set({ accounts: toggleIn(ui.accounts, k) })));
+  // Billing: projects whose sessions recorded no Claude account can be marked "API key" by you; never switched on by
+  // itself. "Likely" = those sessions ran a Claude Code that always records the account when one is logged in.
+  const noAcct = new Map();
+  for (const m of D.sessions.values()) if (!m.acct && m.p) { const path = d.project[m.p], v = noAcct.get(path) || ''; noAcct.set(path, verAtLeast(m.version, '2.1.317') ? '2.1.317' : v); }
+  const billSw = ([path, recent]) => sw(`${projLabel(path).name} uses an API key`, recent ? 'Likely: no Claude account recorded on a recent Claude Code' : 'No Claude account recorded (older Claude Code)', ui.apiProjects.includes(path), () => set({ apiProjects: toggleIn(ui.apiProjects, path) }));
+  const likely = [...noAcct].filter(([, r]) => r), older = [...noAcct].filter(([, r]) => !r);
+  // short controls first (switches, Clear), then accounts, models and billing labels (a setting, easy to miss at the
+  // bottom), then the long project list with its idle projects folded
   fill($('filter-body'),
-    h('p', { class: 'pop-title', text: 'Projects' }),
-    h('div', { class: 'checks' }, [...pc].sort((a, b) => b[1] - a[1]).filter(([p]) => p).map(([p, c]) => { const l = projLabel(d.project[p]); return check(l.name, usdShort(c), ui.projects.includes(d.project[p]), () => set({ projects: toggleIn(ui.projects, d.project[p]) }), null, d.project[p]); }),
-      gone(projSel, 'projects', (n) => projLabel(n).name)),
-    h('p', { class: 'pop-title', text: 'Models' }),
-    h('div', { class: 'checks' }, [...mc].sort((a, b) => b[1] - a[1]).filter(([m]) => m).map(([m, c]) => check(modelName(d.model[m]), usdShort(c), ui.models.includes(d.model[m]), () => set({ models: toggleIn(ui.models, d.model[m]) }), modelColor(d.model[m]), d.model[m])),
-      gone(modelSel, 'models', modelName)),
     sw('Include subagents', 'Explore, general-purpose, forks…', ui.subagents, (v) => set({ subagents: v })),
     sw('Include advisor calls', 'Second-opinion model calls', ui.advisor, (v) => set({ advisor: v })),
-    sw('Include unlogged background calls', 'Billed by Claude Code but not in transcripts; from the cost counters it saves', ui.background, (v) => set({ background: v })),
-    h('div', { class: 'pop-actions' }, h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { set({ projects: [], models: [], subagents: true, advisor: true, background: true }); buildFilters(); }, text: 'Clear filters' })));
+    sw('Include unlogged background calls', 'Counted by Claude Code but not in transcripts; from the cost counters it saves', ui.background, (v) => set({ background: v })),
+    // only while a filter is on (renderTop keeps it in step); once used it hides, so focus moves to the first switch
+    h('div', { class: 'pop-actions', id: 'p-clear', hidden: !filterChips().length || null }, h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { set(NO_FILTERS); buildFilters(); $('filter-body').querySelector('input').focus(); }, text: 'Clear filters' })),
+    acctChecks.length > 1 || acctGone.length ? [h('p', { class: 'pop-title', text: 'Accounts · cost in this range' }), h('div', { class: 'checks' }, acctChecks, acctGone)] : null,
+    h('p', { class: 'pop-title', text: 'Models · cost in this range' }),
+    h('div', { class: 'checks' }, [...mc].sort((a, b) => b[1] - a[1]).filter(([m]) => m).map(([m, c]) => check(modelName(d.model[m]), amt(c), ui.models.includes(d.model[m]), () => set({ models: toggleIn(ui.models, d.model[m]) }), modelColor(d.model[m]), d.model[m])),
+      gone(modelSel, 'models', modelName)),
+    noAcct.size ? [h('p', { class: 'pop-title', id: 'p-billing', text: 'Billing · projects with no account recorded' }), likely.map(billSw),
+      older.length ? h('details', { open: billOlderOpen || null, ontoggle: (e) => { billOlderOpen = e.target.open; } }, h('summary', { class: 'hint', text: `${older.length} project${older.length === 1 ? '' : 's'} with only older sessions` }), older.map(billSw)) : null] : null,
+    h('p', { class: 'pop-title', text: 'Projects · cost in this range' }),
+    projs.length > 8 ? h('label', { class: 'search' }, h('input', { type: 'search', value: projFind, placeholder: 'Find a project', 'aria-label': 'Find a project', oninput: (e) => { projFind = e.target.value; findProj(); } })) : null,
+    h('div', { class: 'checks' }, projChecks, gone(projSel, 'projects', (n) => projLabel(n).name)),
+    idleFold);
+}
+let billOlderOpen = false; // the fold stays open across the popover's rebuilds (a live update, a switch flipped)
+let pIdleOpen = false; // the same for the fold of projects idle in the range
+// the Account row's "API-key projects": opens Filters at its Billing group and puts focus on its first control
+function pShowBilling() {
+  if (pop.kind !== 'open' || pop.id !== 'filter') popEvent({ type: 'toggle', id: 'filter' });
+  const g = $('p-billing'), body = $('filter-body');
+  // not scrollIntoView: it would also scroll the page under the sticky bar. offsetTop is read unscrolled (some
+  // browsers count the list's own scroll in it); 16 is .pop-core's padding, so the title isn't cut
+  body.scrollTop = 0;
+  body.scrollTop = g.offsetTop - body.offsetTop - 16;
+  g.nextElementSibling.querySelector('input, summary').focus({ preventScroll: true });
 }
 
-const live = $('live');
+const live = $('live'), liveSr = $('live-sr');
 function tickLive() {
   live.dataset.state = conn.kind === 'live' ? 'live' : conn.kind === 'connecting' && !conn.attempt ? '' : 'warn';
-  live.lastElementChild.textContent = conn.kind === 'live' ? `Live · ${lastPush ? 'updated ' + ago(lastPush) : 'watching'}`
-    : conn.kind === 'waiting' ? 'Disconnected · retrying' : conn.kind === 'reconnecting' || conn.attempt ? 'Reconnecting…' : 'Connecting';
+  const state = conn.kind === 'live' ? 'Live' : conn.kind === 'waiting' ? 'Disconnected · retrying' : conn.kind === 'reconnecting' || conn.attempt ? 'Reconnecting…' : 'Connecting';
+  live.lastElementChild.textContent = conn.kind === 'live' ? `Live · ${lastPush ? 'updated ' + ago(lastPush) : 'watching'}` : state;
+  live.querySelector('b').textContent = conn.kind === 'live' ? 'Live' : live.dataset.state === 'warn' ? 'Retrying' : 'Connecting'; // what phones show
+  if (liveSr.textContent !== state) liveSr.textContent = state; // announced on change only, never each second
 }
-function ping() { live.classList.remove('ping'); void live.offsetWidth; live.classList.add('ping'); }
+// at most one ping per 10 s: while Claude works, updates arrive up to twice a second and a pulse each time is noise
+let lastPing = 0;
+function ping() { if (Date.now() - lastPing < 1e4) return; lastPing = Date.now(); live.classList.remove('ping'); void live.offsetWidth; live.classList.add('ping'); }
 
 // ---------------------------------------------------------------- account: who Claude Code is logged in as right now
-function renderAccount() {
-  const a = D.meta.account, box = $('account-facts'), btn = $('account-hide');
-  const fact = (k, v, s, cls) => h('div', { class: cls || 'fact' }, k ? h('span', { class: 'k', text: k }) : null, h('span', { class: 'v', text: v }), s ? h('span', { class: 's', text: s }) : null);
+const EYE = 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zm10-3a3 3 0 1 0 0 6 3 3 0 0 0 0-6z';
+const EYE_OFF = 'M3 3l18 18M10.6 5.1A10.9 10.9 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.9 8.4 2 12 2 12s3.5 7 10 7c1.7 0 3.2-.4 4.5-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2';
+let pExtraOpen = false; // the extra-usage explanation stays open across the panel's rebuilds
+function renderAccount(A) {
+  const a = D.meta.account, box = $('account-facts'), btn = $('account-hide'), hid = ui.hideAccount;
+  // how many accounts the numbers below cover ("none" is not an account)
+  const keys = new Set([...A.sessions.keys()].map(acctOf).filter((k) => k !== 'none'));
+  $('account-hint').textContent = keys.size > 1 ? `Current login · ${keys.size} accounts in this range` : 'Current login';
   btn.hidden = !a;
-  btn.firstElementChild.textContent = ui.hideAccount ? 'Show email & org' : 'Hide email & org';
-  if (!a) { fill(box, fact('', 'No Claude login found', 'Logged out, signed in with an API key, or Claude Code has not saved the account yet.', 'fact wide')); return; }
-  // hidden = the real values are not in the page at all (not blurred), so screenshots, screen shares and Ctrl+F show nothing
-  const priv = (v) => (ui.hideAccount ? 'Hidden' : v || '—');
+  btn.setAttribute('aria-pressed', String(hid)); // pressed = hidden; the name stays "Hide personal details"
+  btn.title = hid ? 'Show personal details (p)' : 'Hide personal details (p): email, organization, your user-folder name in paths, prompts, session titles and branch names';
+  fill(btn, icon(hid ? EYE_OFF : EYE));
+  // the way to Filters → Billing, where a project that recorded no account can be marked as using an API key
+  const bill = [...D.sessions.values()].some((m) => !m.acct && m.p) ? h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'data-fk': 'acct:bill', onclick: pShowBilling, text: `API-key projects (${ui.apiProjects.length})` }) : null;
+  if (!a) { fill(box, h('span', { class: 'em', text: 'No Claude login found' }), h('span', { class: 'org', text: 'Logged out, signed in with an API key, or Claude Code has not saved the account yet.' }), bill); return; }
   // plan names come from Claude Code's raw values ('claude_team', 'default_claude_max_5x'); an unknown type shows as is,
   // a tier without a multiplier shows nothing (it is an internal name, not something to act on)
   const plan = a.type.replace(/^claude_/, '').replace(/^./, (c) => c.toUpperCase()) || 'Unknown', x = a.tier.match(/_(\d+x)$/)?.[1];
-  fill(box, fact('Email', priv(a.email)), fact('Plan', x ? `${plan} ${x}` : plan, x ? `${x} usage limits` : ''), fact('Organization', priv(a.org)));
+  // hidden = the real values are not in the page at all (not blurred), so screenshots, screen shares and Ctrl+F show nothing
+  // extra usage: whether going past the plan's limits costs extra money (shown only when Claude Code says); the pill
+  // opens its explanation in line, so a keyboard or a tap reaches it (a title tooltip needs a mouse)
+  const why = h('span', { class: 'hint', hidden: !pExtraOpen || null, text: a.extra ? 'Usage past your plan’s limits is billed as extra usage' : 'Usage stops at your plan’s limits; nothing extra is billed' });
+  const extra = h('button', { class: 'tag', type: 'button', 'data-tone': a.extra ? 'warn' : null, 'data-fk': 'acct:extra', 'aria-expanded': String(pExtraOpen), text: a.extra ? 'Extra usage on' : 'Extra usage off',
+    onclick: () => { pExtraOpen = !pExtraOpen; why.hidden = !pExtraOpen; extra.setAttribute('aria-expanded', String(pExtraOpen)); } });
+  fill(box, h('span', { class: 'tag', text: x ? `${plan} · ${x} limits` : plan }), typeof a.extra === 'boolean' ? [extra, why] : null,
+    hid ? h('span', { class: 'org', text: 'Personal details hidden' })
+      : [h('span', { class: 'em', text: a.email || '—' }), a.org ? h('span', { class: 'org', text: a.org }) : null], bill);
 }
 
 function renderFoot() {
   const m = D.meta;
   fill($('foot'),
-    h('span', null, h('b', { text: 'Local only.' }), ' Nothing leaves this machine.'),
-    h('span', { text: `Reading ${m.root}` }), h('span', { text: `${int(m.files)} files · ${(m.bytes / 1e6).toFixed(0)} MB` }),
-    h('span', { text: 'Spend = API list prices × tokens of each reply, counted once. See “Data & accuracy” for the checks.' }),
+    h('span', { class: 'tag' }, icon('M7 11V8a5 5 0 0 1 10 0v3M6 11h12v9H6z'), 'Local only · nothing leaves this machine'),
+    h('span', { text: 'Press ? for keyboard shortcuts' }),
+    h('span', { text: `Reading ${m.root.split(', ').map(maskPath).join(', ')}` }), h('span', { text: `${int(m.files)} files · ${(m.bytes / 1e6).toFixed(0)} MB` }),
+    h('span', { text: 'Cost = API list prices × tokens of each reply, counted once. See “Data & accuracy” for the checks.' }),
     h('span', { text: `Times in ${m.tz}` }));
 }
 
@@ -1482,7 +1834,7 @@ function renderEvent(ev) {
     if (fx === 'requestFrame') requestAnimationFrame(() => renderEvent({ type: 'frame' }));
     else if (fx === 'draw') draw();
     else if (fx === 'firstReady') {
-      document.querySelectorAll('.card').forEach((c, i) => c.style.setProperty('--i', String(i)));
+      document.querySelectorAll('.card').forEach((c, i) => { c.style.setProperty('--i', String(i)); if (c.getBoundingClientRect().top > innerHeight) c.classList.add('below'); });
       document.body.classList.remove('is-loading'); document.body.classList.add('is-entering');
       setTimeout(() => document.body.classList.remove('is-entering'), 1400);
       loadHistory();
@@ -1492,7 +1844,7 @@ function renderEvent(ev) {
 // Every panel and the card(s) it draws into. A panel off screen is not redrawn on each update: it is marked stale
 // and drawn once it comes near the screen. Most of the page is off screen, so most of each update is skipped.
 const PANELS = [
-  ['top bar', renderTop, ['island']], ['account panel', renderAccount, ['account']], ['spend panel', renderHero, ['spend']], ['tiles', renderKpis, ['kpis']], ['usage panel', renderUsage, ['usage']],
+  ['top bar', renderTop, ['island']], ['spend panel', renderHero, ['spend']], ['tiles', renderKpis, ['kpis']], ['account panel', renderAccount, ['account']], ['usage panel', renderUsage, ['usage']],
   ['models panel', renderModels, ['models']], ['billing panel', renderBilling, ['billing']], ['5-hour windows', renderWindows, ['windows']],
   ['heatmap', renderHeat, ['heat']], ['performance panel', renderPerf, ['perf', 'rhythm']], ['day-by-day panel', renderDays, ['days']],
   ['projects panel', renderProjects, ['projects']], ['tools panel', renderTools, ['tools']], ['attribution panel', renderAttr, ['attr']],
@@ -1512,7 +1864,14 @@ function render() { fresh = false; renderEvent({ type: 'request' }); } // the da
 function draw() {
   if (!D) return; // nothing to draw before the first snapshot; it asks again
   // each panel draws on its own: one failing must not leave the others stale or the page stuck dimmed
-  const safely = (name, fn) => { try { fn(); } catch (e) { console.error(`dashboard: the ${name} failed to draw`, e); } };
+  // a failed panel says so in its own card (a silent stale panel looks like real numbers); the next good draw clears it
+  const safely = (name, fn, boxes = []) => {
+    try { fn(); for (const b of boxes) b.querySelector('.draw-error')?.remove(); }
+    catch (e) {
+      console.error(`dashboard: the ${name} failed to draw`, e);
+      for (const b of boxes) if (!b.querySelector('.draw-error')) b.querySelector('.core')?.append(h('p', { class: 'foot-note draw-error', role: 'alert', text: `This panel couldn’t be drawn (${e.message}). The rest of the page is fine; reloading usually fixes it.` }));
+    }
+  };
   try {
     // panels are rebuilt on every update: remember which rebuilt control had keyboard focus, and drop a tooltip
     // whose numbers are about to change (it returns on the next pointer move)
@@ -1527,7 +1886,7 @@ function draw() {
     }
     const A = lastA, P = lastP;
     if (A && P) {
-      for (const p of PANELS) if (stale.has(p) && (everything || near(p))) { stale.delete(p); safely(p.name, () => p.fn(A, P)); }
+      for (const p of PANELS) if (stale.has(p) && (everything || near(p))) { stale.delete(p); safely(p.name, () => p.fn(A, P), p.boxes); }
       everything = false;
       if (recompute && drawerIsOpen()) safely('session drawer', renderDrawer);
       if (recompute && pop.kind === 'open') safely('open menu', () => popEvent({ type: 'dataChanged', focusInside: $(POPS[pop.id][1]).contains(document.activeElement) }));
@@ -1553,6 +1912,17 @@ function connEvent(ev, data) {
     else if (fx === 'open') connect();
     else if (fx.kind === 'retry') { clearTimeout(retryTimer); retryTimer = setTimeout(() => connEvent({ type: 'retry' }), fx.ms); }
   }
+  // the stream failed before the first snapshot: say so plainly instead of leaving the page dimmed as if still loading;
+  // made once (a rebuilt alert is announced again on every retry), gone with the first data
+  const note = $('l-load-error');
+  if (D) note?.remove();
+  else if (ev.type === 'error' && !note) {
+    document.body.classList.remove('is-loading');
+    fill($('spend-num'), '–'); // the page's placeholder "$0" would read as a real total; the first data fills it in
+    $('filter-chips').after(h('div', { class: 'card', id: 'l-load-error', role: 'alert', style: { marginBottom: 'var(--gap)' } }, h('div', { class: 'core' },
+      h('p', { class: 'draw-error', style: { margin: '0', fontSize: '15px', fontWeight: '500' }, text: 'Can’t reach the dashboard server. Is it running? Retrying…' }),
+      h('p', { class: 'foot-note', text: 'Start it with npm start in the dashboard’s folder. Its first start reads every log before it answers; this page fills in by itself once it does.' }))));
+  }
   tickLive();
 }
 function connect() {
@@ -1564,7 +1934,61 @@ function connect() {
 }
 
 $('usage-table-btn').addEventListener('click', () => set({ usageTable: !ui.usageTable }));
-$('account-hide').addEventListener('click', () => set({ hideAccount: !ui.hideAccount }));
+NARROW.addEventListener('change', render); // the Dates button's text depends on the width
+$('drawer-prev').addEventListener('click', () => stepDrawer(-1));
+$('drawer-next').addEventListener('click', () => stepDrawer(1));
+
+// keyboard shortcuts: never while typing in a field, never with Ctrl, Cmd or Alt
+const SHORTCUTS = [['/', 'Search sessions'], ['1 – 6', 'Range: Today, 24h, 7 days, 30 days, 90 days, All'], ['f', 'Open or close Filters'],
+  ['p', 'Presenting mode: hide or show personal details'],
+  ['j / k', 'Next / previous session, in session details'], ['Esc', 'Close a menu or the session details'], ['?', 'This list']];
+fill($('keys-list'), SHORTCUTS.map(([k, d]) => [h('dt', null, h('kbd', { text: k })), h('dd', { text: d })]));
+addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented || e.isComposing) return;
+  if (e.target.closest?.('input, textarea, select, [contenteditable], dialog')) return;
+  if (drawerIsOpen()) { if (e.key === 'j' || e.key === 'k') { e.preventDefault(); stepDrawer(e.key === 'j' ? 1 : -1); } return; }
+  if (e.key === '/') $('sess-q').focus();
+  else if (/^[1-6]$/.test(e.key)) set({ range: RANGES[+e.key - 1].v });
+  else if (e.key === 'f') $('filter-btn').click();
+  else if (e.key === 'p' && !$('account-hide').hidden) $('account-hide').click(); // Presenting mode, through the eye's own switch (none without a login)
+  else if (e.key === '?') $('keys').showModal();
+  else return;
+  e.preventDefault();
+});
+
+// CSV of what a table holds for the current range and filters. Text that starts with = + - @ gets a leading ' so a
+// spreadsheet never runs a session title from the logs as a formula; numbers stay numbers.
+function downloadCsv(name, rows) {
+  const url = URL.createObjectURL(new Blob(['﻿' + rows.map((r) => r.map(csvCell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }));
+  const a = h('a', { href: url, download: name }); document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1e4);
+}
+const csvRange = () => `${isoDay(lastA.from)}_${isoDay(lastA.to - 1)}`;
+const money = (v) => Math.round(v * 1e4) / 1e4;
+$('sess-csv').addEventListener('click', () => { if (!lastA) return; const d = D.dicts; downloadCsv(`claude-sessions-${csvRange()}.csv`, [
+  ['Started', 'Session', 'Session id', 'Projects', 'Models', 'Length (min)', 'Claude working (min)', 'Prompts', 'API calls', 'Tools', 'Tokens', `${costWord(lastA).short} (USD)`, 'Claude Code’s counter (USD)'],
+  ...sessRows.map((r) => [toLocalInput(r.t0).replace('T', ' '), tSessTitle(r), r.meta.id || '', r.projNames, [...r.models].map((m) => modelName(d.model[m])).join('; '),
+    Math.round(r.span / 6e4), Math.round(r.active / 6e4), r.prompts, r.calls, r.tools, r.tok, money(r.cost), r.cc >= 0 ? money(r.cc) : ''])]); });
+$('bill-csv').addEventListener('click', () => { if (!lastA) return; downloadCsv(`claude-cost-breakdown-${csvRange()}.csv`, [
+  ['Model', 'Calls', 'Input tokens', 'Input (USD)', 'Cache write 5 min tokens', 'Cache write 5 min (USD)', 'Cache write 1 h tokens', 'Cache write 1 h (USD)', 'Cache read tokens', 'Cache read (USD)', 'Output tokens', 'Output (USD)', 'Web searches', 'Web search (USD)', 'Total (USD)'],
+  ...billRows.map(([m, b]) => { const p = b.priced, c = (v) => (p ? money(v) : ''); return [D.dicts.model[m], b.calls, b.in, c(b.cIn), b.cw5, c(b.cCw5), b.cw1, c(b.cCw1), b.cr, c(b.cCr), b.out, c(b.cOut), b.ws, c(b.cWs), c(b.cIn + b.cCw5 + b.cCw1 + b.cCr + b.cOut + b.cWs)]; })]); });
+// jump menu: the zone whose heading has passed the top 40% of the screen is "current"; checked only when a heading
+// crosses that line (an IntersectionObserver), never on every scroll event
+const zones = ['cost', 'activity', 'records'].map((k) => $('zone-' + k));
+const markZone = () => {
+  const cur = zones.filter((z) => z.getBoundingClientRect().top < innerHeight * 0.4).at(-1) || zones[0];
+  for (const a of $('jump').children) a.setAttribute('aria-current', String(a.getAttribute('href') === '#' + cur.id));
+};
+const zoneWatch = new IntersectionObserver(markZone, { rootMargin: '0px 0px -60% 0px' });
+zones.forEach((z) => zoneWatch.observe(z));
+markZone();
+// a big jump (End, Home, a jump link) can carry a heading past the line between two frames, unseen by the observer
+addEventListener('scrollend', markZone);
+$('jump').addEventListener('click', () => requestAnimationFrame(markZone)); // a frame later: the browser has scrolled by then
+// the eye is Presenting mode: every panel redraws through set(); the prompt list redraws from its last answer
+// Off-screen panels are normally redrawn only when scrolled near; here all of them redraw at once (like printing), or a
+// full-page screenshot or Ctrl+F would still find the old text.
+$('account-hide').addEventListener('click', () => { everything = true; set({ hideAccount: !ui.hideAccount }); histReveal = false; if (lastHist) renderHistory(lastHist); });
 $('sess-q').value = ui.sessQ;
 $('sess-q').addEventListener('input', (e) => set({ sessQ: e.target.value }));
 $('hist-q').addEventListener('input', loadHistory);
@@ -1601,10 +2025,10 @@ function openCustom() {
   $('custom-to').value = toLocalInput(t);
   setCustomLive(liveEnd());
   customErr('');
-  for (const b of $('quick-hours').children) b.setAttribute('aria-pressed', String(b.dataset.range === ui.range));
+  for (const b of [...$('quick-range').children, ...$('quick-hours').children]) b.setAttribute('aria-checked', String(b.dataset.range === ui.range));
 }
 const closeCustom = (refocus) => popEvent({ type: 'close', id: 'custom', refocus });
-$('quick-hours').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { set({ range: b.dataset.range }); closeCustom(true); } });
+for (const id of ['quick-range', 'quick-hours']) $(id).addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { set({ range: b.dataset.range }); closeCustom(true); } });
 $('custom-now').addEventListener('click', () => setCustomLive(!customLive));
 $('custom-apply').addEventListener('click', () => {
   const f = $('custom-from').value, t = customLive ? 'now' : $('custom-to').value;
@@ -1640,6 +2064,12 @@ applyTheme();
 
 let lastW = 0; // re-draw charts on width changes only (height changes come from our own renders)
 new ResizeObserver(([e]) => { const w = Math.round(e.contentRect.width); if (w !== lastW) { lastW = w; layoutEpoch++; render(); } }).observe(document.querySelector('.bento'));
+// the usage chart's height follows the Models card beside it, not the width: when it changes, redraw that chart alone
+let lastUH = 0;
+new ResizeObserver(([e]) => {
+  const hh = Math.round(e.contentRect.height);
+  if (hh && hh !== lastUH) { lastUH = hh; sizeCache.delete(e.target); stale.add(PANELS.find((p) => p.fn === renderUsage)); renderEvent({ type: 'request' }); }
+}).observe($('usage-chart'));
 document.fonts?.ready.then(() => { layoutEpoch++; render(); }); // pills and charts are measured: again once Geist has loaded
 // a rolling range moves with the clock even without new data; so does a history list that follows it
 setInterval(() => {

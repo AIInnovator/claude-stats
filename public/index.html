@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Claude Code · Usage stats</title>
-  <meta name="description" content="Live, local usage stats for Claude Code: spend, tokens, models, tools, sessions and 5-hour windows.">
+  <meta name="description" content="Live, local usage stats for Claude Code: cost, tokens, models, tools, sessions and 5-hour windows.">
   <meta name="theme-color" content="#060607">
   <meta name="color-scheme" content="dark light">
   <script src="/theme.js"></script>
@@ -23,21 +23,32 @@
       <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M9 21.5V17m5 4.5V11m5 10.5v-7.5m5 7.5v-4" /></svg>
       <span>Claude Code <em>Stats</em></span>
     </a>
+    <nav class="jump" id="jump" aria-label="Page sections"><a href="#zone-cost">Cost</a><a href="#zone-activity">Activity</a><a href="#zone-records">Records</a></nav>
     <div class="seg" id="range" role="radiogroup" aria-label="Time range"></div>
     <div class="island-tools">
       <div class="pop-anchor">
         <button class="btn btn-ghost" id="custom-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="custom-pop">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M3.5 10h17M8 3v4m8-4v4"/></svg>
-          <span id="custom-label">Dates</span>
+          <span id="custom-label">Dates</span><b class="range-short" id="custom-short"></b>
         </button>
         <div class="pop" id="custom-pop" role="dialog" aria-label="Custom date and time range">
           <div class="pop-core">
+            <!-- narrow screens: the range buttons live here, so the sticky bar stays one row -->
+            <p class="pop-title narrow-only">Range</p>
+            <div class="chips narrow-only" id="quick-range" role="radiogroup" aria-label="Range">
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="today">Today</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="24h">24h</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="7d">7 days</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="30d">30 days</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="90d">90 days</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="all">All</button>
+            </div>
             <p class="pop-title">Last few hours</p>
-            <div class="chips" id="quick-hours">
-              <button class="btn btn-ghost btn-sm" type="button" data-range="h1">1h</button>
-              <button class="btn btn-ghost btn-sm" type="button" data-range="h3">3h</button>
-              <button class="btn btn-ghost btn-sm" type="button" data-range="h6">6h</button>
-              <button class="btn btn-ghost btn-sm" type="button" data-range="h12">12h</button>
+            <div class="chips" id="quick-hours" role="radiogroup" aria-label="Last few hours">
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="h1">1h</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="h3">3h</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="h6">6h</button>
+              <button class="btn btn-ghost btn-sm" type="button" role="radio" aria-checked="false" data-range="h12">12h</button>
             </div>
             <label class="field"><span>From</span><input type="datetime-local" id="custom-from" step="60"></label>
             <label class="field"><span>To</span><input type="datetime-local" id="custom-to" step="60"></label>
@@ -59,29 +70,23 @@
         </div>
       </div>
       <button class="btn btn-icon" id="theme-btn" type="button" aria-label="Theme: system"><svg viewBox="0 0 24 24" aria-hidden="true" id="theme-icon"></svg></button>
-      <div class="live" id="live" role="status" aria-live="polite"><i></i><span>Connecting</span></div>
+      <div class="live" id="live"><i aria-hidden="true"></i><b aria-hidden="true">Connecting</b><span>Connecting</span></div>
+      <!-- screen readers hear the connection state only when it changes, never the seconds counter -->
+      <span class="sr-only" id="live-sr" role="status" aria-live="polite"></span>
+      <span class="sr-only" id="chart-sr" aria-live="polite"></span>
     </div>
   </header>
 
   <main id="main" class="wrap">
+    <h1 class="sr-only">Claude Code usage stats</h1>
+    <div class="filter-chips" id="filter-chips" role="group" aria-label="Active filters" hidden></div>
     <div class="bento">
-      <section class="card span-12" id="account" aria-labelledby="account-h">
-        <div class="core">
-          <div class="card-head">
-            <h2 class="eyebrow" id="account-h">Account</h2>
-            <div class="head-tools">
-              <span class="hint">Logged in to Claude Code right now · updates when you switch with /login · the stats below include every account used on this machine</span>
-              <button class="btn btn-ghost btn-sm" id="account-hide" type="button" aria-controls="account-facts"><span>Hide email &amp; org</span></button>
-            </div>
-          </div>
-          <div class="facts" id="account-facts"></div>
-        </div>
-      </section>
+      <h2 class="zone" id="zone-cost">Cost</h2>
 
       <section class="card span-7 hero" id="spend" aria-labelledby="spend-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="spend-h">Estimated spend</h2>
+            <h3 class="eyebrow" id="spend-h">Estimated cost at API prices</h3>
             <span class="tag" id="spend-range"></span>
           </div>
           <div class="hero-figure">
@@ -89,7 +94,7 @@
             <p class="delta" id="spend-delta"></p>
           </div>
           <p class="hero-sub" id="spend-sub"></p>
-          <div class="spark" id="spark"></div>
+          <div class="spark" id="spark" role="group" aria-label="Cost per period. Arrow keys read each value."></div>
         </div>
       </section>
 
@@ -97,10 +102,29 @@
         <div class="core kpi-grid" id="kpi-grid"></div>
       </section>
 
+      <section class="card span-12" id="account" aria-labelledby="account-h">
+        <div class="core account-row">
+          <h3 class="eyebrow" id="account-h">Account</h3>
+          <div class="account-facts" id="account-facts"></div>
+          <span class="hint" id="account-hint">Current login</span>
+          <button class="btn btn-icon" id="account-hide" type="button" aria-pressed="false" aria-label="Hide personal details"></button>
+        </div>
+      </section>
+
+      <section class="card span-12" id="windows" aria-labelledby="windows-h">
+        <div class="core">
+          <div class="card-head"><h3 class="eyebrow" id="windows-h">5-hour windows</h3><span class="tag" id="window-state"></span></div>
+          <p class="foot-note" id="window-filtered" hidden>Filters don’t apply here: 5-hour windows and limit hits count everything this account did.</p>
+          <div id="window-now"></div>
+          <div class="chart chart-sm" id="window-chart" role="group" aria-label="Five-hour windows in this range. Arrow keys read each window."></div>
+          <p class="foot-note" id="window-note"></p>
+        </div>
+      </section>
+
       <section class="card span-8" id="usage" aria-labelledby="usage-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="usage-h">Usage over time</h2>
+            <h3 class="eyebrow" id="usage-h">Usage over time</h3>
             <div class="head-tools">
               <div class="seg seg-sm" id="metric" role="radiogroup" aria-label="Measure"></div>
               <div class="seg seg-sm" id="split" role="radiogroup" aria-label="Split by"></div>
@@ -115,71 +139,81 @@
 
       <section class="card span-4" id="models" aria-labelledby="models-h">
         <div class="core">
-          <div class="card-head"><h2 class="eyebrow" id="models-h">Models</h2><span class="hint">click to filter</span></div>
+          <div class="card-head"><h3 class="eyebrow" id="models-h">Models</h3><span class="hint">click to filter</span></div>
           <div class="bars" id="model-bars"></div>
+        </div>
+      </section>
+
+      <section class="card span-7" id="projects" aria-labelledby="projects-h">
+        <div class="core">
+          <div class="card-head"><h3 class="eyebrow" id="projects-h">Projects</h3><span class="hint">click to filter</span></div>
+          <div class="bars" id="project-bars"></div>
+        </div>
+      </section>
+
+      <section class="card span-5" id="attr" aria-labelledby="attr-h">
+        <div class="core">
+          <div class="card-head">
+            <h3 class="eyebrow" id="attr-h">Where the cost goes</h3>
+            <div class="seg seg-sm" id="attr-tab" role="radiogroup" aria-label="Attribute cost to"></div>
+          </div>
+          <div class="bars" id="attr-bars"></div>
         </div>
       </section>
 
       <section class="card span-12" id="billing" aria-labelledby="billing-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="billing-h">API billing breakdown</h2>
-            <span class="tag" id="billing-check"></span>
+            <h3 class="eyebrow" id="billing-h">Cost breakdown at API prices</h3>
+            <div class="head-tools"><span class="tag" id="billing-check"></span><button class="btn btn-ghost btn-sm" id="bill-csv" type="button">Download CSV</button></div>
           </div>
           <div class="table-wrap"><table class="grid bill" id="bill-table"></table></div>
-          <p class="foot-note" id="bill-note"></p>
+          <details class="explain"><summary>How this is measured</summary><p class="foot-note" id="bill-note"></p></details>
         </div>
       </section>
 
-      <section class="card span-5" id="windows" aria-labelledby="windows-h">
-        <div class="core">
-          <div class="card-head"><h2 class="eyebrow" id="windows-h">5-hour windows</h2><span class="tag" id="window-state"></span></div>
-          <div id="window-now"></div>
-          <div class="chart chart-sm" id="window-chart"></div>
-          <p class="foot-note" id="window-note"></p>
-        </div>
-      </section>
+      <h2 class="zone" id="zone-activity">Activity</h2>
 
-      <section class="card span-7" id="heat" aria-labelledby="heat-h">
+      <section class="card span-12" id="heat" aria-labelledby="heat-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="heat-h">When you work</h2>
+            <h3 class="eyebrow" id="heat-h">When you work</h3>
             <div class="head-tools">
               <div class="seg seg-sm" id="heat-range" role="radiogroup" aria-label="Heatmap time range"></div>
               <div class="seg seg-sm" id="heat-metric" role="radiogroup" aria-label="Heatmap measure"></div>
             </div>
           </div>
-          <div class="heatmap" id="heatmap"></div>
-          <p class="foot-note" id="heat-note"></p>
+          <div class="heatmap" id="heatmap" role="group" aria-label="When you work, by weekday and hour. Arrow keys move between hours, up and down between days."></div>
+          <details class="explain"><summary>How this is measured</summary><p class="foot-note" id="heat-note"></p></details>
         </div>
       </section>
 
       <section class="card span-12" id="perf" aria-labelledby="perf-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="perf-h">Claude’s performance</h2>
+            <h3 class="eyebrow" id="perf-h">Claude’s performance</h3>
             <span class="hint" id="perf-hint">how fast and how cleanly Claude worked, over this range and by hour</span>
           </div>
           <div class="perf" id="perf-grid"></div>
-          <p class="foot-note" id="perf-note"></p>
+          <details class="explain"><summary>How this is measured</summary><p class="foot-note" id="perf-note"></p></details>
         </div>
       </section>
 
       <section class="card span-12" id="rhythm" aria-labelledby="rhythm-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="rhythm-h">Your rhythm</h2>
+            <h3 class="eyebrow" id="rhythm-h">Your rhythm</h3>
             <span class="hint">mood and focus signals from how you worked with Claude</span>
           </div>
           <div class="perf" id="rhythm-grid"></div>
-          <p class="foot-note" id="rhythm-note"></p>
+          <details class="explain"><summary>How this is measured</summary><p class="foot-note" id="rhythm-note"></p></details>
         </div>
       </section>
 
       <section class="card span-12" id="days" aria-labelledby="days-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="days-h">Day by day</h2>
+            <h3 class="eyebrow" id="days-h">Day by day</h3>
             <div class="legend" id="days-legend"></div>
           </div>
           <div class="days" id="days-list"></div>
@@ -187,54 +221,34 @@
         </div>
       </section>
 
-      <section class="card span-4" id="projects" aria-labelledby="projects-h">
-        <div class="core">
-          <div class="card-head"><h2 class="eyebrow" id="projects-h">Projects</h2><span class="hint">click to filter</span></div>
-          <div class="bars" id="project-bars"></div>
-        </div>
-      </section>
-
       <section class="card span-4" id="tools" aria-labelledby="tools-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="tools-h">Tools</h2>
+            <h3 class="eyebrow" id="tools-h">Tools</h3>
             <div class="seg seg-sm" id="tool-sort" role="radiogroup" aria-label="Sort tools by"></div>
           </div>
           <div class="bars" id="tool-bars"></div>
         </div>
       </section>
 
-      <section class="card span-4" id="attr" aria-labelledby="attr-h">
+      <section class="card span-8" id="behaviour" aria-labelledby="behaviour-h">
         <div class="core">
-          <div class="card-head">
-            <h2 class="eyebrow" id="attr-h">Where the spend goes</h2>
-            <div class="seg seg-sm" id="attr-tab" role="radiogroup" aria-label="Attribute spend to"></div>
-          </div>
-          <div class="bars" id="attr-bars"></div>
-        </div>
-      </section>
-
-      <section class="card span-12" id="behaviour" aria-labelledby="behaviour-h">
-        <div class="core">
-          <div class="card-head"><h2 class="eyebrow" id="behaviour-h">How Claude worked</h2></div>
+          <div class="card-head"><h3 class="eyebrow" id="behaviour-h">How Claude worked</h3></div>
           <div class="facts" id="facts"></div>
         </div>
       </section>
 
-      <section class="card span-12" id="accuracy" aria-labelledby="acc-h">
-        <div class="core">
-          <div class="card-head"><h2 class="eyebrow" id="acc-h">Data &amp; accuracy</h2><span class="hint">how every number above is produced and checked</span></div>
-          <div class="acc" id="acc"></div>
-        </div>
-      </section>
+      <h2 class="zone" id="zone-records">Records</h2>
 
       <section class="card span-12" id="sessions" aria-labelledby="sessions-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="sessions-h">Sessions</h2>
+            <h3 class="eyebrow" id="sessions-h">Sessions</h3>
             <label class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg><input type="search" id="sess-q" placeholder="Filter by title, project or id" aria-label="Filter sessions"></label>
+            <button class="btn btn-ghost btn-sm" id="sess-csv" type="button">Download CSV</button>
           </div>
           <div class="table-wrap"><table class="grid" id="sess-table"></table></div>
+          <span class="sr-only" id="sess-hint">Press Enter to open this session's details.</span>
           <div class="table-foot" id="sess-foot"></div>
         </div>
       </section>
@@ -242,7 +256,7 @@
       <section class="card span-12" id="history" aria-labelledby="history-h">
         <div class="core">
           <div class="card-head">
-            <h2 class="eyebrow" id="history-h">Prompt history</h2>
+            <h3 class="eyebrow" id="history-h">Prompt history</h3>
             <div class="head-tools">
               <div class="seg seg-sm" id="hist-range" role="radiogroup" aria-label="Prompt history time range"></div>
               <label class="search search-wide"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg><input type="search" id="hist-q" placeholder="Search what you asked" aria-label="Search prompt history"></label>
@@ -250,6 +264,14 @@
           </div>
           <p class="foot-note" id="hist-meta"></p>
           <ol class="hist" id="hist-list"></ol>
+          <div class="hist-more" id="hist-more"></div>
+        </div>
+      </section>
+
+      <section class="card span-12" id="accuracy" aria-labelledby="acc-h">
+        <div class="core">
+          <div class="card-head"><h3 class="eyebrow" id="acc-h">Data &amp; accuracy</h3><span class="hint">how every number above is produced and checked</span></div>
+          <div class="acc" id="acc"></div>
         </div>
       </section>
     </div>
@@ -262,15 +284,26 @@
     <div class="drawer-core">
       <div class="drawer-head">
         <div>
-          <p class="eyebrow">Session</p>
+          <p class="eyebrow">Session <span id="drawer-pos"></span></p>
           <h2 id="drawer-title"></h2>
           <p class="drawer-sub" id="drawer-sub"></p>
+          <span class="sr-only" id="drawer-live" role="status" aria-live="polite"></span>
         </div>
-        <button class="btn btn-icon" id="drawer-close" aria-label="Close session details"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        <div class="drawer-nav">
+          <button class="btn btn-icon" id="drawer-prev" type="button" aria-label="Previous session" title="Previous session (k)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
+          <button class="btn btn-icon" id="drawer-next" type="button" aria-label="Next session" title="Next session (j)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+          <button class="btn btn-icon" id="drawer-close" aria-label="Close session details"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        </div>
       </div>
       <div class="drawer-body" id="drawer-body"></div>
     </div>
   </aside>
+
+  <dialog class="keys" id="keys" aria-labelledby="keys-h">
+    <h2 id="keys-h">Keyboard shortcuts</h2>
+    <dl id="keys-list"></dl>
+    <form method="dialog"><button class="btn btn-ghost btn-sm" type="submit">Close</button></form>
+  </dialog>
 
   <div class="tip" id="tip" role="tooltip"></div>
 </body>
