@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Code · Usage stats</title>
+  <meta name="description" content="Live, local usage stats for Claude Code: spend, tokens, models, tools, sessions and 5-hour windows.">
+  <meta name="theme-color" content="#060607">
+  <meta name="color-scheme" content="dark light">
+  <script src="/theme.js"></script>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body class="is-loading">
+  <a class="skip" href="#main">Skip to the stats</a>
+  <div class="ambient" aria-hidden="true"></div>
+
+  <header class="island" id="island">
+    <a class="brand" href="/" aria-label="Claude Code stats, reload">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M9 21.5V17m5 4.5V11m5 10.5v-7.5m5 7.5v-4" /></svg>
+      <span>Claude Code <em>Stats</em></span>
+    </a>
+    <div class="seg" id="range" role="radiogroup" aria-label="Time range"></div>
+    <div class="island-tools">
+      <div class="pop-anchor">
+        <button class="btn btn-ghost" id="custom-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="custom-pop">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M3.5 10h17M8 3v4m8-4v4"/></svg>
+          <span id="custom-label">Dates</span>
+        </button>
+        <div class="pop" id="custom-pop" role="dialog" aria-label="Custom date and time range">
+          <div class="pop-core">
+            <p class="pop-title">Last few hours</p>
+            <div class="chips" id="quick-hours">
+              <button class="btn btn-ghost btn-sm" type="button" data-range="h1">1h</button>
+              <button class="btn btn-ghost btn-sm" type="button" data-range="h3">3h</button>
+              <button class="btn btn-ghost btn-sm" type="button" data-range="h6">6h</button>
+              <button class="btn btn-ghost btn-sm" type="button" data-range="h12">12h</button>
+            </div>
+            <label class="field"><span>From</span><input type="datetime-local" id="custom-from" step="60"></label>
+            <label class="field"><span>To</span><input type="datetime-local" id="custom-to" step="60"></label>
+            <p class="field-error" id="custom-error" role="alert" hidden></p>
+            <div class="pop-actions">
+              <button class="btn btn-ghost btn-sm" type="button" id="custom-now" aria-pressed="false" title="End the range at the current time and keep it moving">Live to now</button>
+              <button class="btn btn-primary" type="button" id="custom-apply"><span>Apply range</span></button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pop-anchor">
+        <button class="btn btn-ghost" id="filter-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="filter-pop">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10m-7 6h4"/></svg>
+          <span>Filters</span><b class="count" id="filter-count" hidden></b>
+        </button>
+        <div class="pop pop-wide" id="filter-pop" role="dialog" aria-label="Filters">
+          <div class="pop-core" id="filter-body"></div>
+        </div>
+      </div>
+      <button class="btn btn-icon" id="theme-btn" type="button" aria-label="Theme: system"><svg viewBox="0 0 24 24" aria-hidden="true" id="theme-icon"></svg></button>
+      <div class="live" id="live" role="status" aria-live="polite"><i></i><span>Connecting</span></div>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    <div class="bento">
+      <section class="card span-12" id="account" aria-labelledby="account-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="account-h">Account</h2>
+            <div class="head-tools">
+              <span class="hint">Logged in to Claude Code right now · updates when you switch with /login · the stats below include every account used on this machine</span>
+              <button class="btn btn-ghost btn-sm" id="account-hide" type="button" aria-controls="account-facts"><span>Hide email &amp; org</span></button>
+            </div>
+          </div>
+          <div class="facts" id="account-facts"></div>
+        </div>
+      </section>
+
+      <section class="card span-7 hero" id="spend" aria-labelledby="spend-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="spend-h">Estimated spend</h2>
+            <span class="tag" id="spend-range"></span>
+          </div>
+          <div class="hero-figure">
+            <p class="hero-num" id="spend-num">$0</p>
+            <p class="delta" id="spend-delta"></p>
+          </div>
+          <p class="hero-sub" id="spend-sub"></p>
+          <div class="spark" id="spark"></div>
+        </div>
+      </section>
+
+      <section class="card span-5" id="kpis" aria-label="Key numbers">
+        <div class="core kpi-grid" id="kpi-grid"></div>
+      </section>
+
+      <section class="card span-8" id="usage" aria-labelledby="usage-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="usage-h">Usage over time</h2>
+            <div class="head-tools">
+              <div class="seg seg-sm" id="metric" role="radiogroup" aria-label="Measure"></div>
+              <div class="seg seg-sm" id="split" role="radiogroup" aria-label="Split by"></div>
+              <button class="btn btn-ghost btn-sm" id="usage-table-btn" aria-pressed="false"><span>Table</span></button>
+            </div>
+          </div>
+          <div class="legend" id="usage-legend"></div>
+          <div class="chart" id="usage-chart"></div>
+          <div class="table-view" id="usage-table" hidden></div>
+        </div>
+      </section>
+
+      <section class="card span-4" id="models" aria-labelledby="models-h">
+        <div class="core">
+          <div class="card-head"><h2 class="eyebrow" id="models-h">Models</h2><span class="hint">click to filter</span></div>
+          <div class="bars" id="model-bars"></div>
+        </div>
+      </section>
+
+      <section class="card span-12" id="billing" aria-labelledby="billing-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="billing-h">API billing breakdown</h2>
+            <span class="tag" id="billing-check"></span>
+          </div>
+          <div class="table-wrap"><table class="grid bill" id="bill-table"></table></div>
+          <p class="foot-note" id="bill-note"></p>
+        </div>
+      </section>
+
+      <section class="card span-5" id="windows" aria-labelledby="windows-h">
+        <div class="core">
+          <div class="card-head"><h2 class="eyebrow" id="windows-h">5-hour windows</h2><span class="tag" id="window-state"></span></div>
+          <div id="window-now"></div>
+          <div class="chart chart-sm" id="window-chart"></div>
+          <p class="foot-note" id="window-note"></p>
+        </div>
+      </section>
+
+      <section class="card span-7" id="heat" aria-labelledby="heat-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="heat-h">When you work</h2>
+            <div class="head-tools">
+              <div class="seg seg-sm" id="heat-range" role="radiogroup" aria-label="Heatmap time range"></div>
+              <div class="seg seg-sm" id="heat-metric" role="radiogroup" aria-label="Heatmap measure"></div>
+            </div>
+          </div>
+          <div class="heatmap" id="heatmap"></div>
+          <p class="foot-note" id="heat-note"></p>
+        </div>
+      </section>
+
+      <section class="card span-12" id="perf" aria-labelledby="perf-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="perf-h">Claude’s performance</h2>
+            <span class="hint" id="perf-hint">how fast and how cleanly Claude worked, over this range and by hour</span>
+          </div>
+          <div class="perf" id="perf-grid"></div>
+          <p class="foot-note" id="perf-note"></p>
+        </div>
+      </section>
+
+      <section class="card span-12" id="rhythm" aria-labelledby="rhythm-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="rhythm-h">Your rhythm</h2>
+            <span class="hint">mood and focus signals from how you worked with Claude</span>
+          </div>
+          <div class="perf" id="rhythm-grid"></div>
+          <p class="foot-note" id="rhythm-note"></p>
+        </div>
+      </section>
+
+      <section class="card span-12" id="days" aria-labelledby="days-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="days-h">Day by day</h2>
+            <div class="legend" id="days-legend"></div>
+          </div>
+          <div class="days" id="days-list"></div>
+          <div class="table-foot" id="days-foot"></div>
+        </div>
+      </section>
+
+      <section class="card span-4" id="projects" aria-labelledby="projects-h">
+        <div class="core">
+          <div class="card-head"><h2 class="eyebrow" id="projects-h">Projects</h2><span class="hint">click to filter</span></div>
+          <div class="bars" id="project-bars"></div>
+        </div>
+      </section>
+
+      <section class="card span-4" id="tools" aria-labelledby="tools-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="tools-h">Tools</h2>
+            <div class="seg seg-sm" id="tool-sort" role="radiogroup" aria-label="Sort tools by"></div>
+          </div>
+          <div class="bars" id="tool-bars"></div>
+        </div>
+      </section>
+
+      <section class="card span-4" id="attr" aria-labelledby="attr-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="attr-h">Where the spend goes</h2>
+            <div class="seg seg-sm" id="attr-tab" role="radiogroup" aria-label="Attribute spend to"></div>
+          </div>
+          <div class="bars" id="attr-bars"></div>
+        </div>
+      </section>
+
+      <section class="card span-12" id="behaviour" aria-labelledby="behaviour-h">
+        <div class="core">
+          <div class="card-head"><h2 class="eyebrow" id="behaviour-h">How Claude worked</h2></div>
+          <div class="facts" id="facts"></div>
+        </div>
+      </section>
+
+      <section class="card span-12" id="accuracy" aria-labelledby="acc-h">
+        <div class="core">
+          <div class="card-head"><h2 class="eyebrow" id="acc-h">Data &amp; accuracy</h2><span class="hint">how every number above is produced and checked</span></div>
+          <div class="acc" id="acc"></div>
+        </div>
+      </section>
+
+      <section class="card span-12" id="sessions" aria-labelledby="sessions-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="sessions-h">Sessions</h2>
+            <label class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg><input type="search" id="sess-q" placeholder="Filter by title, project or id" aria-label="Filter sessions"></label>
+          </div>
+          <div class="table-wrap"><table class="grid" id="sess-table"></table></div>
+          <div class="table-foot" id="sess-foot"></div>
+        </div>
+      </section>
+
+      <section class="card span-12" id="history" aria-labelledby="history-h">
+        <div class="core">
+          <div class="card-head">
+            <h2 class="eyebrow" id="history-h">Prompt history</h2>
+            <div class="head-tools">
+              <div class="seg seg-sm" id="hist-range" role="radiogroup" aria-label="Prompt history time range"></div>
+              <label class="search search-wide"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg><input type="search" id="hist-q" placeholder="Search what you asked" aria-label="Search prompt history"></label>
+            </div>
+          </div>
+          <p class="foot-note" id="hist-meta"></p>
+          <ol class="hist" id="hist-list"></ol>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="wrap foot" id="foot"></footer>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
+    <div class="drawer-core">
+      <div class="drawer-head">
+        <div>
+          <p class="eyebrow">Session</p>
+          <h2 id="drawer-title"></h2>
+          <p class="drawer-sub" id="drawer-sub"></p>
+        </div>
+        <button class="btn btn-icon" id="drawer-close" aria-label="Close session details"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="drawer-body" id="drawer-body"></div>
+    </div>
+  </aside>
+
+  <div class="tip" id="tip" role="tooltip"></div>
+</body>
+</html>
