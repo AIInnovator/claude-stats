@@ -10,7 +10,7 @@ import { FILE_UNSEEN, fileStep, scanInit, scanStep, FIRST_DELAY_MS, MIN_GAP_MS, 
 import {
   TOOL_NONE, TOOL_CALL, TOOL_RESULT, TOOL_COMPLETE, hasCall, toolStep, COUNTER_EMPTY, counterStep, intervalOf, attribution,
   CONN_START, connStep, RENDER_START, renderStep, DRAWER_CLOSED, drawerStep, HIST_IDLE, histStep, UI_DEFAULT, uiStep, selection,
-  POP_CLOSED, popStep, billingClass, mergeAccounts, followAccount, verAtLeast, csvCell, viewFromQuery, viewToQuery,
+  POP_CLOSED, popStep, billingClass, mergeAccounts, planLabel, followAccount, verAtLeast, csvCell, viewFromQuery, viewToQuery,
 } from '../public/machines.js';
 import { Store, Tailer } from '../lib/store.mjs';
 
@@ -266,6 +266,18 @@ ok('account memory: changes only when the plan, tier, org or day change; never s
   const c = mergeAccounts(a.memory, [{ key: 'k1', type: '', tier: '', org: '' }], '2026-11-16');
   assert.deepEqual(c.memory.k1, { type: 'claude_team', tier: 't5', org: 'Org', seen: '2026-11-16' }, 'an empty field never erases what was learned');
   assert.equal(mergeAccounts(a.memory, [null, { key: '' }, { type: 'x' }], '2026-11-15').changed, false, 'junk entries are ignored');
+});
+ok('plan names: Team seats named, the multiplier kept, nothing guessed', () => {
+  // raw values sampled from real logins (16 Nov 2026): Standard seat default_raven, Premium seat default_claude_max_5x
+  assert.deepEqual(planLabel('claude_team', 'default_raven'), { full: 'Team · Standard seat', short: 'Team Standard' });
+  assert.deepEqual(planLabel('claude_team', 'default_claude_max_5x'), { full: 'Team · Premium seat · 5x limits', short: 'Team Premium 5x' });
+  assert.deepEqual(planLabel('claude_team', ''), { full: 'Team', short: 'Team' }, 'no tier recorded: the seat is not guessed');
+  assert.deepEqual(planLabel('claude_max', 'default_claude_max_5x'), { full: 'Max · 5x limits', short: 'Max 5x' });
+  assert.deepEqual(planLabel('claude_max', 'default_claude_max_20x'), { full: 'Max · 20x limits', short: 'Max 20x' }, 'Ultra is not named until verified');
+  assert.deepEqual(planLabel('claude_pro', 'default_claude_pro'), { full: 'Pro', short: 'Pro' });
+  assert.deepEqual(planLabel('claude_enterprise', ''), { full: 'Enterprise', short: 'Enterprise' });
+  assert.deepEqual(planLabel('claude_ultra', 'x_10x'), { full: 'Ultra · 10x limits', short: 'Ultra 10x' }, 'an unseen type keeps its own name');
+  assert.deepEqual(planLabel(undefined, undefined), { full: 'Unknown', short: 'Unknown' });
 });
 ok('5-hour windows follow one account: the picked one, else the current login, else the most used', () => {
   const use = new Map([['k1', 5], ['k2', 9], ['none', 50]]);

@@ -3,3 +3,5 @@ scripts/.tmp-*/
 .tmp-*/
 docs/superpowers/
 .impeccable/
+# local Windows launcher, never published
+start.bat

@@ -1,4 +1,5 @@
-# Push a tag such as v1.0.0 and this publishes the GitHub release, with that version's CHANGELOG.md section as notes.
+# Push a tag such as v1.0.0 and this publishes the GitHub release, with that version's CHANGELOG.md section as notes;
+# re-pushing an existing tag (moved to a newer commit) updates that release in place.
 name: Release
 
 on:
@@ -38,7 +39,13 @@ jobs:
           irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.ps1 | iex
           \`\`\`
           EOF
+      # a re-pushed tag (the release replaced in place) updates that release's notes instead of failing
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          fi

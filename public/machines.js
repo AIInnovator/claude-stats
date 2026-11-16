@@ -227,6 +227,18 @@ export function mergeAccounts(memory, entries, today) {
   return { memory: next || memory, changed: !!next };
 }
 
+/**
+ * Plan words from the two raw values Claude Code saves (organizationType, userRateLimitTier): full for the Account
+ * row, short for account labels. A Team tier with a multiplier is a Premium seat, any other one a Standard seat (no
+ * tier: the seat isn't guessed). Unseen types keep their own name, so a new plan still reads sensibly.
+ */
+export function planLabel(type, tier) {
+  const t = String(type || ''), x = String(tier || '').match(/_(\d+x)$/)?.[1];
+  const name = t.replace(/^claude_/, '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()) || 'Unknown';
+  if (t === 'claude_team' && tier) return x ? { full: `Team · Premium seat · ${x} limits`, short: `Team Premium ${x}` } : { full: 'Team · Standard seat', short: 'Team Standard' };
+  return x ? { full: `${name} · ${x} limits`, short: `${name} ${x}` } : { full: name, short: name };
+}
+
 /** The account the 5-hour windows follow: the one picked in the filter, else the current login, else the most used. */
 export function followAccount(picked, currentKey, usageByKey) {
   const real = (picked || []).filter((k) => k !== 'none');

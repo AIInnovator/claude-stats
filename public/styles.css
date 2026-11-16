@@ -165,7 +165,7 @@ svg { display: block; }
 .btn:active { transform: scale(0.97); }
 .btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .btn-ghost { background: var(--wash); border-color: var(--hair); color: var(--ink-2); }
-.btn-ghost[aria-expanded='true'], .btn-ghost[aria-pressed='true'] { background: var(--wash-2); color: var(--ink); border-color: var(--hair-2); }
+.btn-ghost[aria-expanded='true'], .btn-ghost[aria-pressed='true'], .btn-icon[aria-pressed='true'] { background: var(--wash-2); color: var(--ink); border-color: var(--hair-2); }
 .btn-primary { background: var(--ink); color: var(--on-ink); }
 .btn-sm { height: 30px; padding: 0 12px; font-size: 12.5px; }
 .btn-icon { width: 36px; padding: 0; background: var(--wash); border-color: var(--hair); color: var(--ink-2); }
@@ -364,15 +364,41 @@ button.bar:active { transform: scale(0.99); }
 .fact li b { font: 500 12px var(--mono); color: var(--ink); white-space: nowrap; }
 .fact li span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fact .bad { color: var(--crit); } .fact .meh { color: var(--warn); } .fact .okk { color: var(--good); }
-/* account: one quiet line, sized to what it holds */
-.account-row { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 10px 16px; padding: 12px 12px 12px 22px; }
-/* a 260px basis makes the facts take their own line on a phone instead of shrinking to a sliver */
-.account-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; flex: 1 1 260px; min-width: 0; font-size: 13.5px; }
-.account-facts .em { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; }
-.account-facts .org { color: var(--ink-2); overflow-wrap: anywhere; }
-/* the extra-usage pill opens its explanation: the dotted underline is the usual "explained term" mark */
-.account-facts button.tag { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
-@media (pointer: coarse) { .account-facts button.tag { height: 40px; } } /* a tap target, like .btn-sm beside it */
+/* account: one quiet line of groups (who is logged in · plan · actions). Each group wraps as a unit and every wrapped
+   line centres its own items, so presenting, long names or the explanation never reshuffle the row */
+.core.account-row { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 10px 16px; padding: 12px 16px 12px 22px; }
+.account-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; min-width: 0; }
+.account-facts { display: contents; } /* its groups take part in the row's own layout */
+.account-plan { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.account-id { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0 10px; flex: 1 1 auto; min-width: 0; font-size: 13.5px; }
+.account-id .em { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; }
+.account-id .org { color: var(--ink-2); overflow-wrap: anywhere; }
+.account-id > * { line-height: 20px; } /* the presenting note sits exactly where the org would */
+.account-row .tag, .account-row .hint, .account-row .btn-sm { font-size: 12px; } /* three sizes in the row, not five */
+.account-bill { margin-left: auto; }
+.account-row:not(:has(.account-bill)) #account-hide { margin-left: auto; }
+.account-why { flex-basis: 100%; order: 9; transition: opacity 160ms var(--ease-out); }
+@starting-style { .account-why { opacity: 0; } }
+/* the extra-usage pill opens its explanation: a chevron says so, and it answers hover and press like the buttons */
+.account-extra { position: relative; cursor: pointer; transition: transform 160ms var(--ease-out), background-color 160ms ease, border-color 160ms ease; }
+.account-extra:active { transform: scale(0.97); }
+.account-extra[aria-expanded='true'] { background: var(--wash-2); border-color: var(--hair-2); }
+.account-extra svg { margin-right: -3px; transition: transform 160ms var(--ease-out); }
+.account-extra[aria-expanded='true'] svg { transform: rotate(180deg); }
+@media (pointer: coarse) { .account-extra::after { content: ''; position: absolute; inset: -10px 0; } } /* a 44px tap target with the same 24px look */
+/* tablets: the identity gets its own line, so turning Presenting mode on or off never changes the card's height */
+@media (max-width: 1180px) { .account-id { order: 5; flex-basis: 100%; } }
+/* narrow screens: line 1 is the heading and the eye (like every card head; the heading leaves the eye exactly its
+   room), then the plan with the API-key button, then the identity; phones put the button last */
+@media (max-width: 820px) {
+  .core.account-row { padding: 12px 12px 14px 16px; }
+  .account-head { flex: 1 0 calc(100% - 64px); }
+  #account-hide { order: 1; }
+  .account-plan { order: 2; }
+  .account-bill { order: 3; margin-left: 0; }
+}
+/* phones: identity as two lines (email over org, or "Account 2" over the presenting note), so the height holds either way */
+@media (max-width: 600px) { .account-bill { order: 6; } .account-id { flex-direction: column; align-items: flex-start; gap: 2px; } }
 .draw-error { color: var(--crit); }
 .seg-bar { display: flex; height: 8px; gap: 2px; margin-top: 6px; }
 .seg-bar i { display: block; height: 100%; border-radius: 2px; min-width: 2px; }
@@ -463,6 +489,7 @@ body.is-loading .core > *:not(.card-head) { opacity: 0.35; }
 @media (hover: hover) and (pointer: fine) {
   .seg button:not(:disabled):hover { color: var(--ink); }
   .btn-ghost:hover, .btn-icon:hover { background: var(--wash-2); color: var(--ink); border-color: var(--hair-2); }
+  .account-extra:hover { background: var(--wash-2); border-color: var(--hair-2); } /* not its colour: "on" stays amber */
   .btn-primary:hover { background: var(--primary-hover); }
   button.bar:hover { background: var(--wash); }
   .check:hover { background: var(--wash); }
@@ -535,7 +562,7 @@ body.is-loading .core > *:not(.card-head) { opacity: 0.35; }
   *, *::before, *::after { animation-duration: 1ms !important; animation-delay: 0ms !important; }
   .seg-active, .drawer, .drawer[data-open], .switch::after { transition: none; }
   .pop, .pop[data-open] { transform: none; }
-  .btn:active, button.bar:active { transform: none; }
+  .btn:active, button.bar:active, .account-extra:active { transform: none; }
 }
 
 /* ---------- performance small multiples ---------- */

@@ -2,7 +2,27 @@
 
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org).
 
-## 1.0.0 (15 Nov 2026)
+## 1.0.0 (16 Nov 2026)
+
+Account card and plan names
+- Plan names now say the Team seat:
+  - "Team · Premium seat · 5x limits" and "Team · Standard seat" in the Account row.
+  - "Team Premium 5x" and "Team Standard" in Filters and the 5-hour windows note.
+
+  Pro, Max and Enterprise read as claude.com/pricing names them. One tested rule (`planLabel`) names plans everywhere.
+- Account card, from a design review (27/40):
+  - **Presenting mode:**
+    - works without a Claude login, and `p` works everywhere, also inside session details
+    - the eye stays highlighted while it is on, with one name and tooltip
+    - screen readers hear the switch
+    - the row shows "Account 2" instead of "Personal details hidden"
+  - **Layout:** the row is grouped as who · plan · actions.
+    - Opening the Extra usage explanation, or switching Presenting mode, no longer moves anything sideways or changes the card's height.
+    - On phones the eye stays top-right.
+  - **Extra usage pill:** it has hover, press and open states, an arrow, and a 44px tap target, and keeps its look.
+  - **API-key button:** it reads "Mark API-key projects" (or "API-key projects: N") and sits with the eye.
+  - **Polish:** three text sizes instead of five, and even padding.
+  - **No login:** the message says to run `/login`, and the hint says "No login" instead of "Current login".
 
 Install and project
 - One-line installers: `install.sh` for macOS and Linux, `install.ps1` for Windows. Each one:

@@ -3,7 +3,7 @@
 import { PALETTES, MODEL_ORDER } from './palette.js';
 import {
   hasCall, intervalOf, attribution, CONN_START, connStep, RENDER_START, renderStep, DRAWER_CLOSED, drawerStep,
-  HIST_IDLE, histStep, UI_DEFAULT, uiStep, selection, POP_CLOSED, popStep, billingClass, mergeAccounts, followAccount, verAtLeast,
+  HIST_IDLE, histStep, UI_DEFAULT, uiStep, selection, POP_CLOSED, popStep, billingClass, mergeAccounts, planLabel, followAccount, verAtLeast,
   csvCell, viewFromQuery, viewToQuery,
 } from './machines.js';
 
@@ -222,7 +222,7 @@ function rememberAccounts() {
   if (r.changed) { acctMem = r.memory; try { localStorage.setItem(ACCT_STORE, JSON.stringify(acctMem)); } catch { /* full or blocked */ } }
 }
 const acctOf = (s) => D.sessions.get(s)?.acct || 'none';
-const planName = (type, tier) => { const p = (type || '').replace(/^claude_/, '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()) || 'Unknown', x = (tier || '').match(/_(\d+x)$/)?.[1]; return x ? `${p} ${x}` : p; };
+const planName = (type, tier) => planLabel(type, tier).short;
 // per data version, settings and memory: each session's billing class, and account numbers in order of first use
 let acctCache = { v: '' };
 function acctInfo() {
@@ -1787,31 +1787,34 @@ function ping() { if (Date.now() - lastPing < 1e4) return; lastPing = Date.now()
 // ---------------------------------------------------------------- account: who Claude Code is logged in as right now
 const EYE = 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zm10-3a3 3 0 1 0 0 6 3 3 0 0 0 0-6z';
 const EYE_OFF = 'M3 3l18 18M10.6 5.1A10.9 10.9 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.9 8.4 2 12 2 12s3.5 7 10 7c1.7 0 3.2-.4 4.5-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2';
+const CHEVRON = 'M6 9l6 6 6-6';
 let pExtraOpen = false; // the extra-usage explanation stays open across the panel's rebuilds
+// The row's groups (plan, identity, explanation, API-key button) sit in #account-facts, which is display: contents, so
+// the CSS can order them per width; the eye works with or without a login, since Presenting covers the whole page.
 function renderAccount(A) {
   const a = D.meta.account, box = $('account-facts'), btn = $('account-hide'), hid = ui.hideAccount;
   // how many accounts the numbers below cover ("none" is not an account)
   const keys = new Set([...A.sessions.keys()].map(acctOf).filter((k) => k !== 'none'));
-  $('account-hint').textContent = keys.size > 1 ? `Current login · ${keys.size} accounts in this range` : 'Current login';
-  btn.hidden = !a;
-  btn.setAttribute('aria-pressed', String(hid)); // pressed = hidden; the name stays "Hide personal details"
-  btn.title = hid ? 'Show personal details (p)' : 'Hide personal details (p): email, organization, your user-folder name in paths, prompts, session titles and branch names';
+  $('account-hint').textContent = (a ? 'Current login' : 'No login') + (keys.size > 1 ? ` · ${keys.size} accounts in this range` : '');
+  btn.setAttribute('aria-pressed', String(hid)); // the name stays "Presenting mode"; pressed = on
   fill(btn, icon(hid ? EYE_OFF : EYE));
   // the way to Filters → Billing, where a project that recorded no account can be marked as using an API key
-  const bill = [...D.sessions.values()].some((m) => !m.acct && m.p) ? h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'data-fk': 'acct:bill', onclick: pShowBilling, text: `API-key projects (${ui.apiProjects.length})` }) : null;
-  if (!a) { fill(box, h('span', { class: 'em', text: 'No Claude login found' }), h('span', { class: 'org', text: 'Logged out, signed in with an API key, or Claude Code has not saved the account yet.' }), bill); return; }
-  // plan names come from Claude Code's raw values ('claude_team', 'default_claude_max_5x'); an unknown type shows as is,
-  // a tier without a multiplier shows nothing (it is an internal name, not something to act on)
-  const plan = a.type.replace(/^claude_/, '').replace(/^./, (c) => c.toUpperCase()) || 'Unknown', x = a.tier.match(/_(\d+x)$/)?.[1];
-  // hidden = the real values are not in the page at all (not blurred), so screenshots, screen shares and Ctrl+F show nothing
+  const n = ui.apiProjects.length;
+  const bill = [...D.sessions.values()].some((m) => !m.acct && m.p) ? h('button', { class: 'btn btn-ghost btn-sm account-bill', type: 'button', 'data-fk': 'acct:bill', onclick: pShowBilling, text: n ? `API-key projects: ${n}` : 'Mark API-key projects' }) : null;
+  if (!a) { fill(box, h('span', { class: 'account-id' }, h('span', { class: 'em', text: 'No Claude login found' }), h('span', { class: 'org', text: 'Run /login in Claude Code. With an API key there is no login to show.' })), bill); return; }
+  // hidden = the real values are not in the page at all (not blurred), so screenshots, screen shares and Ctrl+F show
+  // nothing; "Account 2" (the number the 5-hour panel and Filters use) still tells a work login from a personal one
+  const num = acctInfo().num.get(a.key);
+  const who = hid ? [h('span', { class: 'em', text: num ? `Account ${num}` : 'Account' }), h('span', { class: 'hint', text: 'Presenting mode: details hidden' })]
+    : [h('span', { class: 'em', text: a.email || '—' }), a.org ? h('span', { class: 'org', text: a.org }) : null];
   // extra usage: whether going past the plan's limits costs extra money (shown only when Claude Code says); the pill
-  // opens its explanation in line, so a keyboard or a tap reaches it (a title tooltip needs a mouse)
-  const why = h('span', { class: 'hint', hidden: !pExtraOpen || null, text: a.extra ? 'Usage past your plan’s limits is billed as extra usage' : 'Usage stops at your plan’s limits; nothing extra is billed' });
-  const extra = h('button', { class: 'tag', type: 'button', 'data-tone': a.extra ? 'warn' : null, 'data-fk': 'acct:extra', 'aria-expanded': String(pExtraOpen), text: a.extra ? 'Extra usage on' : 'Extra usage off',
-    onclick: () => { pExtraOpen = !pExtraOpen; why.hidden = !pExtraOpen; extra.setAttribute('aria-expanded', String(pExtraOpen)); } });
-  fill(box, h('span', { class: 'tag', text: x ? `${plan} · ${x} limits` : plan }), typeof a.extra === 'boolean' ? [extra, why] : null,
-    hid ? h('span', { class: 'org', text: 'Personal details hidden' })
-      : [h('span', { class: 'em', text: a.email || '—' }), a.org ? h('span', { class: 'org', text: a.org }) : null], bill);
+  // opens its explanation on its own line, so a keyboard or a tap reaches it and nothing beside it moves
+  const known = typeof a.extra === 'boolean';
+  const why = h('span', { class: 'hint account-why', id: 'acct-extra-why', hidden: !pExtraOpen || null, text: a.extra ? 'Usage past your plan’s limits is billed as extra usage' : 'Usage stops at your plan’s limits; nothing extra is billed' });
+  const extra = h('button', { class: 'tag account-extra', type: 'button', 'data-tone': a.extra ? 'warn' : null, 'data-fk': 'acct:extra', 'aria-expanded': String(pExtraOpen), 'aria-controls': 'acct-extra-why',
+    onclick: () => { pExtraOpen = !pExtraOpen; why.hidden = !pExtraOpen; extra.setAttribute('aria-expanded', String(pExtraOpen)); } }, a.extra ? 'Extra usage on' : 'Extra usage off', icon(CHEVRON));
+  fill(box, h('span', { class: 'account-plan' }, h('span', { class: 'tag', text: planLabel(a.type, a.tier).full }), known ? extra : null),
+    h('span', { class: 'account-id' }, who), known ? why : null, bill);
 }
 
 function renderFoot() {
@@ -1946,11 +1949,12 @@ fill($('keys-list'), SHORTCUTS.map(([k, d]) => [h('dt', null, h('kbd', { text: k
 addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented || e.isComposing) return;
   if (e.target.closest?.('input, textarea, select, [contenteditable], dialog')) return;
+  // Presenting mode works everywhere, also inside the session details, where titles and branch names show
+  if (e.key === 'p') { e.preventDefault(); togglePresenting(); return; }
   if (drawerIsOpen()) { if (e.key === 'j' || e.key === 'k') { e.preventDefault(); stepDrawer(e.key === 'j' ? 1 : -1); } return; }
   if (e.key === '/') $('sess-q').focus();
   else if (/^[1-6]$/.test(e.key)) set({ range: RANGES[+e.key - 1].v });
   else if (e.key === 'f') $('filter-btn').click();
-  else if (e.key === 'p' && !$('account-hide').hidden) $('account-hide').click(); // Presenting mode, through the eye's own switch (none without a login)
   else if (e.key === '?') $('keys').showModal();
   else return;
   e.preventDefault();
@@ -1988,7 +1992,12 @@ $('jump').addEventListener('click', () => requestAnimationFrame(markZone)); // a
 // the eye is Presenting mode: every panel redraws through set(); the prompt list redraws from its last answer
 // Off-screen panels are normally redrawn only when scrolled near; here all of them redraw at once (like printing), or a
 // full-page screenshot or Ctrl+F would still find the old text.
-$('account-hide').addEventListener('click', () => { everything = true; set({ hideAccount: !ui.hideAccount }); histReveal = false; if (lastHist) renderHistory(lastHist); });
+// the eye and the p key; the eye's name stays "Presenting mode", so screen readers hear the new state here instead
+function togglePresenting() {
+  everything = true; set({ hideAccount: !ui.hideAccount }); histReveal = false; if (lastHist) renderHistory(lastHist);
+  $('account-sr').textContent = ui.hideAccount ? 'Presenting mode on: personal details hidden' : 'Presenting mode off';
+}
+$('account-hide').addEventListener('click', togglePresenting);
 $('sess-q').value = ui.sessQ;
 $('sess-q').addEventListener('input', (e) => set({ sessQ: e.target.value }));
 $('hist-q').addEventListener('input', loadHistory);
